@@ -1,107 +1,53 @@
+//! Routing one Telegram update: the filters say what arrived, the arrival builder says what it
+//! means, and everything after that is the inbound tail's.
+
 use std::sync::Arc;
 
 use teloxide::{
     Bot,
-    dispatching::{HandlerExt, UpdateFilterExt},
+    dispatching::{Dispatcher, ShutdownToken, UpdateFilterExt},
     dptree,
-    prelude::*,
     types::{Me, Message, Update},
-    utils::command::BotCommands,
 };
+use tokio::sync::oneshot;
 
-use super::{command::Command, message_handler::MessageHandler, util::msg_chat_type};
-use crate::{
-    agent::{
-        event::{AgentCommand, WakeEvent, WakeReason},
-        runtime::registry::SessionManager,
-    },
-    app::AppContext,
-    domain::vo::ChatId,
-    error::{AppError, Result},
-};
+use super::arrival::{self, BotIdentity};
+use crate::{agent::intake::Intake, domain::repo::ChangeKind, error::Result};
 
-pub struct TelegramDispatcher {
+pub(super) struct TelegramDispatcher {
     bot: Bot,
-    allowed_chat_ids: Vec<i64>,
-    msg_handler: MessageHandler,
+    intake: Arc<Intake>,
 }
 
 impl TelegramDispatcher {
-    pub async fn new(
-        bot: Bot,
-        ctx: AppContext,
-        registry: SessionManager,
-        allowed_chat_ids: Vec<i64>,
-    ) -> Result<Self> {
-        bot.set_my_commands(Command::bot_commands()).await?;
-        Ok(Self {
-            bot,
-            allowed_chat_ids,
-            msg_handler: MessageHandler::new(ctx, registry),
-        })
+    pub(super) async fn new(bot: Bot, intake: Arc<Intake>) -> Self {
+        Self { bot, intake }
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub(super) async fn run(self, shutdown_tx: oneshot::Sender<ShutdownToken>) {
         let this = Arc::new(self);
 
-        let dispatcher_handler = Update::filter_message().branch(
-            dptree::entry()
-                .filter(|bot: Bot, msg: Message, dp: Arc<TelegramDispatcher>| {
-                    if !dp.is_allowed_chat(msg.chat.id) {
-                        tokio::spawn(async move {
-                            if let Err(err) = dp.handle_unauthorized_message(bot, msg).await {
-                                tracing::error!("Failed to handle unauthorized message: {}", err);
-                            }
-                            Ok::<(), AppError>(())
-                        });
-                        return false;
-                    }
-                    true
-                })
-                .branch(dptree::entry().filter_command::<Command>().endpoint(
-                    |bot: Bot, msg: Message, cmd: Command, dp: Arc<TelegramDispatcher>| async move {
-                        if let Err(err) = dp.handle_command(bot, msg, cmd).await {
-                            tracing::error!("Failed to handle command: {err}");
-                        }
-                        Ok::<(), AppError>(())
-                    },
-                ))
-                .endpoint(
-                    |msg: Message, me: Me, dp: Arc<TelegramDispatcher>| async move {
-                        if let Err(err) = dp.handle_message(msg, me).await {
-                            tracing::error!("Failed to handle message: {}", err);
-                        }
-                        Ok::<(), AppError>(())
-                    },
-                ),
-        );
+        let dispatcher_handler = dptree::entry()
+            .branch(Update::filter_message().endpoint(
+                |msg: Message, me: Me, dp: Arc<TelegramDispatcher>| async move {
+                    dp.handle_message(msg, me).await
+                },
+            ))
+            .branch(Update::filter_edited_message().endpoint(
+                |msg: Message, me: Me, dp: Arc<TelegramDispatcher>| async move {
+                    dp.handle_edited(msg, me).await
+                },
+            ));
 
-        Dispatcher::builder(this.bot.clone(), dispatcher_handler)
+        // Do not enable teloxide's `enable_ctrlc_handler`: it registers a second
+        // SIGINT listener that shuts the dispatcher down on its own, cancelling the
+        // in-flight GetUpdates long poll — which teloxide's default error handler
+        // then reports as a spurious ERROR instead of a clean stop.
+        let mut dispatcher = Dispatcher::builder(this.bot.clone(), dispatcher_handler)
             .dependencies(dptree::deps![Arc::clone(&this)])
-            .enable_ctrlc_handler()
-            .build()
-            .dispatch()
-            .await;
-
-        Ok(())
-    }
-
-    fn is_allowed_chat(&self, chat_id: teloxide::types::ChatId) -> bool {
-        self.allowed_chat_ids.contains(&chat_id.0)
-    }
-
-    async fn handle_unauthorized_message(&self, _bot: Bot, msg: Message) -> Result<()> {
-        tracing::warn!(
-            "Unauthorized message attempt from chat_id: {}, user: {:?}",
-            msg.chat.id,
-            msg.from.as_ref().map(|u| &u.username)
-        );
-        if let Some(text) = msg.text()
-            && text == "/start"
-        {
-            self.bot.send_message(msg.chat.id,  "You are not authorized to use this bot. If you think this is a mistake, please contact the bot owner.").await?;
-        }
-        Ok(())
+            .build();
+        let _ = shutdown_tx.send(dispatcher.shutdown_token());
+        dispatcher.dispatch().await;
     }
 
     async fn handle_message(&self, msg: Message, me: Me) -> Result<()> {
@@ -113,118 +59,50 @@ impl TelegramDispatcher {
             from = %from.full_name(),
             "Message received",
         );
-        let chat_type = msg_chat_type(&msg);
-
-        let (chat, account) = self
-            .msg_handler
-            .resolve_chat_and_account(&msg, from, chat_type)
-            .await?;
-        self.msg_handler
-            .persist_user_message(&msg, ChatId::from(chat.id), account.id)
-            .await?;
-        self.msg_handler
-            .dispatch_agent_event(ChatId::from(chat.id), chat_type, &msg, &me)
-            .await;
-
-        Ok(())
+        // A message the bot first sees after it was edited still carries the platform's edit time.
+        let change = ChangeKind::Created {
+            edited_at: edited_at(&msg)?,
+        };
+        self.deliver(&msg, &me, change).await
     }
 
-    async fn handle_command(&self, _bot: Bot, msg: Message, cmd: Command) -> Result<()> {
-        // 命令输入与普通消息同路径落库（agent 上下文可见用户打了什么命令）
-        let chat_type = msg_chat_type(&msg);
+    /// An edit is a change, not a command, and only its sender can edit a message — so a message the
+    /// bot sent can only have been edited by the bot.
+    async fn handle_edited(&self, msg: Message, me: Me) -> Result<()> {
         let Some(from) = msg.from.as_ref() else {
-            tracing::warn!("Command without sender: {:?}", msg.id);
             return Ok(());
         };
-        let (chat, account) = self
-            .msg_handler
-            .resolve_chat_and_account(&msg, from, chat_type)
-            .await?;
-        self.msg_handler
-            .persist_user_message(&msg, ChatId::from(chat.id), account.id)
-            .await?;
+        if from.id == me.user.id {
+            return Ok(());
+        }
+        let change = arrival::change_kind(true, edited_at(&msg)?)?;
+        self.deliver(&msg, &me, change).await
+    }
 
-        match cmd {
-            Command::Start => {
-                self.bot.send_message(msg.chat.id, "Hello!").await?;
-            }
-            Command::Status => {
-                let inner_chat_id = ChatId::from(chat.id);
-                let status_msg = match self
-                    .msg_handler
-                    .session(inner_chat_id)
-                    .await?
-                    .status()
-                    .await
-                {
-                    Some(s) => {
-                        let sched = &s.scheduler;
-                        let mut lines = vec![format!("model   {}", s.model)];
-
-                        let runs_line = if let Some(secs) = s.turn_elapsed_secs {
-                            format!("steps   {} · active {:.1}s", s.step_count, secs)
-                        } else {
-                            format!("steps   {}", s.step_count)
-                        };
-                        lines.push(runs_line);
-
-                        if s.context_tokens > 0 {
-                            lines.push(format!("tokens  {}", fmt_tokens(s.context_tokens)));
-                        }
-
-                        lines.push(format!("conv    {} msgs", s.conversation_msgs));
-
-                        let heat =
-                            format!("heat    {:.2} / {:.2}", sched.heat_value, sched.heat_base);
-                        let heat_line = if sched.window_active {
-                            let secs = sched.window_closes_in_secs.unwrap_or(0.0) as i64;
-                            format!("{} · window {}s", heat, secs)
-                        } else {
-                            heat
-                        };
-                        lines.push(heat_line);
-
-                        lines.join("\n")
-                    }
-                    None => "model   (no session)".into(),
-                };
-                self.bot.send_message(msg.chat.id, status_msg).await?;
-            }
-            Command::OrganizeMemory => {
-                let inner_chat_id = ChatId::from(chat.id);
-                self.msg_handler
-                    .session(inner_chat_id)
-                    .await?
-                    .wake(WakeEvent::new(WakeReason::Command(
-                        AgentCommand::OrganizeMemory,
-                    )));
-            }
-            Command::Explain => {
-                let inner_chat_id = ChatId::from(chat.id);
-                self.msg_handler
-                    .session(inner_chat_id)
-                    .await?
-                    .wake(WakeEvent::new(WakeReason::Command(AgentCommand::Explain)));
-            }
-            Command::Digest(days) => {
-                let inner_chat_id = ChatId::from(chat.id);
-                let days = days.max(1);
-                self.msg_handler
-                    .session(inner_chat_id)
-                    .await?
-                    .wake(WakeEvent::new(WakeReason::Command(AgentCommand::Digest(
-                        days,
-                    ))));
+    /// One update read into an arrival and handed to the inbound tail; what the platform made of it
+    /// is dropped when it belongs to another bot.
+    async fn deliver(&self, msg: &Message, me: &Me, change: ChangeKind) -> Result<()> {
+        let bot = BotIdentity {
+            username: me.user.username.as_deref().unwrap_or_default(),
+            user_id: me.user.id,
+        };
+        match arrival::arrival(msg, &bot, change)? {
+            Some(arrival) => self.intake.accept(arrival).await,
+            None => {
+                tracing::debug!(
+                    chat_id = %msg.chat.id,
+                    "Slash command addressed to another bot, ignored",
+                );
+                Ok(())
             }
         }
-        Ok(())
     }
 }
 
-fn fmt_tokens(n: u32) -> String {
-    if n >= 1000 {
-        format!("{}.{}k", n / 1000, (n % 1000) / 100)
-    } else {
-        n.to_string()
-    }
+/// The platform's own edit time, when it reports one.
+fn edited_at(msg: &Message) -> Result<Option<jiff::Timestamp>> {
+    msg.edit_date()
+        .map(|at| jiff::Timestamp::from_second(at.timestamp()))
+        .transpose()
+        .map_err(Into::into)
 }

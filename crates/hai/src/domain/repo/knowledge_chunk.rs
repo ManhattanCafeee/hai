@@ -1,7 +1,13 @@
 use sqlx::PgPool;
-use uuid::Uuid;
 
-use crate::{domain::model::KnowledgeChunk, error::Result, util::pgvector};
+use crate::{
+    domain::{
+        model::KnowledgeChunk,
+        repo::{lexical, vector},
+        vo::{KnowledgeChunkId, KnowledgeDocumentId},
+    },
+    error::Result,
+};
 
 #[derive(Debug, Clone)]
 pub struct KnowledgeChunkRepo {
@@ -13,38 +19,54 @@ impl KnowledgeChunkRepo {
         Self { pool }
     }
 
-    /// pgvector 向量检索，返回 top-k `(id, distance)`。
-    /// 算子 `<->`（L2 距离，与 `pgvector::search_embedding_vec` 保持一致）。
-    /// `document_ids: Some` = 文档白名单过滤（`= ANY($2)` 参数化绑定）。
     pub async fn search_by_embedding(
         &self,
         query: &[f32],
-        document_ids: Option<&[Uuid]>,
+        document_ids: Option<&[KnowledgeDocumentId]>,
         limit: i64,
-    ) -> Result<Vec<(Uuid, f64)>> {
-        let qv = pgvector::vec_to_pgstring(query);
-        let mut sql = String::from(
-            "SELECT id, embedding <-> $1::vector AS distance \
-             FROM knowledge_chunk WHERE embedding IS NOT NULL",
-        );
-        let mut n = 1usize;
-        if document_ids.is_some() {
-            n += 1;
-            sql.push_str(&format!(" AND document_id = ANY(${n})"));
-        }
-        n += 1;
-        sql.push_str(&format!(" ORDER BY embedding <-> $1::vector LIMIT ${n}"));
-
-        let mut q = sqlx::query_as::<_, (Uuid, f64)>(sqlx::AssertSqlSafe(sql.as_str())).bind(qv);
-        if let Some(ids) = document_ids {
-            q = q.bind(ids);
-        }
-        let rows = q.bind(limit).fetch_all(&self.pool).await?;
-        Ok(rows)
+    ) -> Result<Vec<(KnowledgeChunkId, f64)>> {
+        let raw_document_ids = document_ids.map(KnowledgeDocumentId::raw_ids);
+        let rows = match raw_document_ids.as_deref() {
+            Some(ids) => {
+                vector::search_document_embedding_vec(&self.pool, query, ids, limit).await?
+            }
+            None => {
+                vector::search_unscoped_embedding_vec(
+                    &self.pool,
+                    vector::EmbeddingTable::KnowledgeChunk,
+                    query,
+                    limit,
+                )
+                .await?
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(id, distance)| (KnowledgeChunkId(id), distance))
+            .collect())
     }
 
-    /// 按 id 批量取块（检索结果溯源用）。
-    pub async fn by_ids(&self, ids: &[Uuid]) -> Result<Vec<KnowledgeChunk>> {
+    /// Chunks whose content carries any of the keywords, most matches first; the lexical leg of
+    /// hybrid search. `document_ids` of `None` searches every document.
+    pub async fn search_keywords(
+        &self,
+        keywords: &[String],
+        document_ids: Option<&[KnowledgeDocumentId]>,
+        limit: i64,
+    ) -> Result<Vec<KnowledgeChunkId>> {
+        let patterns = lexical::patterns(keywords);
+        let raw_document_ids = document_ids.map(KnowledgeDocumentId::raw_ids);
+        let rows: Vec<(uuid::Uuid,)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(keyword_search_sql().as_str()))
+                .bind(raw_document_ids.as_deref())
+                .bind(&patterns)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id,)| KnowledgeChunkId(id)).collect())
+    }
+
+    pub async fn by_ids(&self, ids: &[KnowledgeChunkId]) -> Result<Vec<KnowledgeChunk>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -55,4 +77,18 @@ impl KnowledgeChunkRepo {
                 .await?;
         Ok(rows)
     }
+}
+
+/// The lexical leg's statement: the keyword patterns are bound at `$2`.
+fn keyword_search_sql() -> String {
+    format!(
+        "SELECT c.id FROM knowledge_chunk c \
+         WHERE ($1::uuid[] IS NULL OR c.document_id = ANY($1)) \
+         AND {} \
+         ORDER BY {}, \
+                  c.seq ASC \
+         LIMIT $3",
+        lexical::match_predicate(&["c.content"], 2),
+        lexical::match_rank(&["c.content"], 2),
+    )
 }

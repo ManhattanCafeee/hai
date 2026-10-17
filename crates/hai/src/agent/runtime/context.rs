@@ -1,48 +1,106 @@
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use derive_more::Deref;
 
-use super::shell::ShellRuntime;
 use crate::{
-    agent::{event::WakeEvents, link::PlatformHandler, multimodal::MultimodalService},
-    agentcore::skills::SkillManager,
-    app::AppContext,
-    domain::{model::ChatType, service::DbServices, vo::ChatId},
+    agent::{multimodal::MultimodalService, runtime::event::AgentEventBus, settings::Settings},
+    agentcore::{
+        api::{
+            embedding::EmbeddingApi,
+            rerank::{RerankApi, Scorer},
+        },
+        provider::ChatTransport,
+    },
+    config::{AppConfig, ProviderRegistry, model_role},
+    domain::{
+        db,
+        repo::{Repos, vector},
+        service::Services,
+    },
+    error::Result,
 };
 
-/// 一轮 task 的完整执行上下文（prompt 构建 + 工具执行共用）
-pub struct TurnContext {
-    pub app: AppContext,
-    pub chat_id: ChatId,
-    pub chat_type: ChatType,
-    pub handler: Arc<dyn PlatformHandler>,
-    pub events: WakeEvents,
-    pub skill_manager: SkillManager,
-    pub db: DbServices,
-    pub shell: Arc<Mutex<ShellRuntime>>,
-    pub multimodal: MultimodalService,
+#[derive(Clone, Deref)]
+pub struct AppContext {
+    inner: Arc<AppContextInner>,
 }
 
-impl TurnContext {
-    /// `ToolContext` 工厂：从完整上下文中提取工具层字段。
-    pub fn tool_ctx(&self) -> ToolContext {
-        ToolContext {
-            chat_id: self.chat_id,
-            handler: self.handler.clone(),
-            db: self.db.clone(),
-            shell: self.shell.clone(),
-            skill_manager: self.skill_manager.clone(),
-            multimodal: self.multimodal.clone(),
-        }
+pub struct AppContextInner {
+    pub cfg: Arc<AppConfig>,
+    pub settings: Settings,
+    pub services: Services,
+    pub chat_transport: ChatTransport,
+    pub multimodal: MultimodalService,
+    pub event_bus: AgentEventBus,
+}
+
+/// Everything a process builds before it can serve: the provider registry, the ModelRoles resolved
+/// against it, and the database services they feed.
+pub(crate) struct Assembly {
+    pub chat_transport: ChatTransport,
+    pub multimodal: MultimodalService,
+    pub services: Services,
+    pub repos: Repos,
+}
+
+/// Wires a process in the one order it requires: providers, then the model roles they resolve, then
+/// the pool.
+pub(crate) async fn assemble(cfg: &AppConfig) -> Result<Assembly> {
+    let providers = ProviderRegistry::discover(cfg).await;
+
+    let roles = model_role::resolve(cfg, &providers)?;
+    let multimodal = MultimodalService::from_config(cfg, &roles)?;
+    let retrieval = &cfg.agent.retrieval;
+    let scorer = roles
+        .rerank
+        .as_ref()
+        .map(|target| -> Result<Scorer> {
+            Ok(Scorer::new(
+                Arc::new(RerankApi::new(target.clone(), retrieval.timeout_secs)?),
+                retrieval.candidates,
+                retrieval.candidate_chars,
+            ))
+        })
+        .transpose()?;
+    let chat_transport = roles.chat;
+
+    let (pool, dimension) = db::init_db_with_dimension(cfg).await?;
+    vector::assert_embedding_dimension(&pool, dimension).await?;
+    let repos = Repos::new(pool);
+    let services = Services::new(
+        repos.clone(),
+        Arc::new(EmbeddingApi::new(roles.embedding)?),
+        scorer,
+    );
+
+    Ok(Assembly {
+        chat_transport,
+        multimodal,
+        services,
+        repos,
+    })
+}
+
+impl AppContext {
+    pub async fn new(cfg: Arc<AppConfig>) -> Result<Self> {
+        let Assembly {
+            chat_transport,
+            multimodal,
+            services,
+            repos,
+        } = assemble(&cfg).await?;
+        let settings = Settings::new(Arc::clone(&cfg), services.clone());
+        let event_bus = AgentEventBus::new(repos.event.clone());
+
+        Ok(Self {
+            inner: Arc::new(AppContextInner {
+                cfg,
+                settings,
+                services,
+                chat_transport,
+                multimodal,
+                event_bus,
+            }),
+        })
     }
-}
-
-/// 工具层窄上下文（不含 `AppContext`）。
-pub struct ToolContext {
-    pub chat_id: ChatId,
-    pub handler: Arc<dyn PlatformHandler>,
-    pub db: DbServices,
-    pub shell: Arc<Mutex<ShellRuntime>>,
-    pub skill_manager: SkillManager,
-    pub multimodal: MultimodalService,
 }

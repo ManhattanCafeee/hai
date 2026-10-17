@@ -1,15 +1,18 @@
 use serde::{Deserialize, Serialize};
-use strum::{Display, EnumString, IntoStaticStr};
+use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
-use crate::domain::vo::ChatId;
+use crate::domain::{
+    model::Platform,
+    vo::{ChatId, enum_column},
+};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Chat {
-    pub id: i64,
+    pub id: ChatId,
 
-    pub platform: String,
+    pub platform: Platform,
     pub external_id: String,
-    pub chat_type: String,
+    pub chat_type: ChatType,
     pub name: Option<String>,
     pub meta: Option<serde_json::Value>,
     #[sqlx(try_from = "jiff_sqlx::Timestamp")]
@@ -18,24 +21,43 @@ pub struct Chat {
     pub updated_at: jiff::Timestamp,
 }
 
-impl Chat {
-    pub fn id_(&self) -> ChatId {
-        ChatId(self.id)
-    }
-
-    pub fn chat_type(&self) -> Option<ChatType> {
-        self.chat_type.parse().ok()
-    }
+/// The payload one chat row is written from.
+#[derive(Debug, Clone)]
+pub struct NewChat {
+    pub platform: Platform,
+    pub external_id: String,
+    pub chat_type: ChatType,
+    pub name: Option<String>,
+    pub meta: Option<serde_json::Value>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
 }
 
 #[derive(
-    Debug, Copy, Clone, PartialEq, Eq, Display, EnumString, IntoStaticStr, Serialize, Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Display,
+    EnumIter,
+    EnumString,
+    IntoStaticStr,
+    Serialize,
+    Deserialize,
 )]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum ChatType {
     Private,
     Group,
-    Supergroup,
     Channel,
+}
+
+enum_column!(ChatType);
+
+impl ChatType {
+    pub fn as_str(&self) -> &'static str {
+        (*self).into()
+    }
 }

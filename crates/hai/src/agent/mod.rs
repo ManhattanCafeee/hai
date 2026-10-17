@@ -1,10 +1,15 @@
+pub(crate) mod channel;
+pub(crate) mod command;
 pub(crate) mod context;
-pub mod link;
+pub(crate) mod copy;
+pub(crate) mod intake;
 pub(crate) mod multimodal;
-pub(crate) mod node;
-pub(crate) mod personality;
+pub(crate) mod role;
 pub(crate) mod runtime;
+pub(crate) mod settings;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod tools;
+pub(crate) mod web;
 
-pub use multimodal::{MediaSource, MultimodalService};
 pub(crate) use runtime::event;

@@ -1,89 +1,97 @@
 # architecture
 
-> Cross-package dependencies, layering constraints, event system, assembly root, and underlying infrastructure. Must read when changes touch cross-module wiring, dependency direction, or event persistence.
+> Layering, the channel traits, the event system, the module map. Read before touching cross-module wiring, dependency direction or event persistence.
 
 ## Architecture declaration
 
-Top-down layering chain `app → platform → agent → agentcore + config + domain` (also includes the `util / error / infra` underlying layers), with dependencies pointed downward only (DDD dependency direction); agentcore is a core library with zero agent/domain dependencies, config is a pure data layer, and domain is a data layer; platform details are kept out of the agent layer by two traits. Altogether this conforms to the philosophy (single-direction layering + type-driven). Two known dependency violations are listed below; no new violations of the same kind are allowed.
+Layered top-down — `app → platform → agent → agentcore + config + domain`, over `util` / `error` — with dependencies pointing downward. `agentcore` is a core library with no `agent`/`domain`/`config` dependencies, `config` is pure data, `domain` is the data layer, and no platform detail reaches the agent layer except through the channel traits (`agent/channel.rs:Channel` outbound, `ChannelAccess` inbound). No cycle remains: every edge runs downward. Adding an upward dependency is a defect.
 
-### Layering & dependency direction (measured)
+### Measured dependencies
 
 ```txt
 app → platform → agent → agentcore + domain + config
-                     ↘  domain → agentcore(embedding trait) + util + sqlx
-agentcore → config (mcp.rs reads McpConfig — known one-way violation, not a cycle, see below)
-util → agentcore (pgvector.rs → embedding::EmbeddingService)
-error.rs has no internal deps (only thiserror/strum)
+                     ↘  domain → agentcore (the embedding and rerank traits, plus `Language`)
+config → agentcore (Language, ModelKind, ProviderKind, Credential, ModelTarget, mcp::McpConfig)
+domain → config (the database block) + error
+agentcore → util (text) + error
+platform → agent + agentcore + config + domain + error
+cli → app + agent + agentcore + config + domain + error
+error.rs → nothing internal
 ```
 
-- **`agentcore/` has zero `crate::agent` / `crate::domain` references** (verified by grep) — hard rule satisfied
-- **Known violation 1 (domain reverse direction)**: `domain/service/mod.rs` depends on `agent::multimodal::MultimodalService` (injected into `DbServices` as `Arc<dyn EmbeddingService>`). See "Evolution direction" for the refactor direction. **No new violations of the same kind allowed**
-- **Known violation 2 (agentcore → config, one-way)**: only `agentcore/mcp.rs:connect` reads `config::schema::McpConfig` — the original agentcore↔config cycle has been broken (config→agentcore references cleared), but the remaining one-way dependency still violates the "agentcore zero dependency" principle; `ProviderKind` is now in agentcore/provider.rs, `ProviderEntry` is in config/provider_manager.rs (they do not reference each other). Must be handled before splitting the crate.
-- Platform details are entirely kept out of the agent layer by two traits: `agent/link.rs:PlatformHandler` (platform operations) + `agent/context/types.rs:ContentParser` (content parsing, implemented by the platform and injected via `handler.content_parser()`) — the tools layer has zero concrete platform imports
+- **`agentcore` names no config type**: the MCP block's own types (`agentcore/mcp.rs:McpConfig`, `McpTransport`) live with the client that reads them, and `agentcore/mcp.rs:McpManager::from_config` takes the `[mcp]` map instead of the whole `AppConfig`, so every cross-edge above is downward — which is what a crate split would need.
+
+Nothing else points upward: the process container lives in `agent/runtime/context.rs:AppContext` — the lowest layer that can name every one of its parts (config, domain services, agent settings and the event bus) — so only the composition root enters it (`app/mod.rs:serve` for the bot, `cli.rs:Cli::execute` for a management command).
+
+`agentcore` referencing `crate::agent` or `crate::domain` is the one hard prohibition, and it holds today.
+
+### The channel traits
+
+Two agent-owned traits, the handle the agent acts through, the platform layer's own adapter contract, and two shared pieces:
+
+- `agent/channel.rs:Channel` — what the platform layer implements for one configured channel: its key, its profile, its declaration, and the verbs that act on a chat (send something, start the typing indicator, read a platform file). The agent acts through `agent/channel.rs:ChannelHandle`, which binds one chat to that channel, so no caller re-pairs a chat id with a channel; the outbound vocabulary is `ReplyTo` (where in the chat: topic, reference, quote — where `reference` is an agent-side message id and `quote` narrows it to a part, never a platform value) and `OutboundMessage` (that plus the chat and the payload). A send's receipt (`platform/adapter.rs:SentMessage`/`SentAttachment`) and the adapter's own message types belong to the platform layer, because that layer is their only reader. What the renderer produces is the renderer's own type (`agent/context/types.rs:BuiltContext`).
+- `agent/channel.rs:ChannelAccess` — the inbound half: whether a chat may talk to this channel and how to deliver host copy. `platform/adapter.rs:ChannelAdapter` declares it as a supertrait, so the adapter the tail receives provably satisfies it, and no forwarding code exists.
+- `platform/adapter.rs:ChannelAdapter` — the platform layer's own contract, implemented once per platform and named by no agent code.
+- `platform/outbound.rs:OutboundRecorder` — implements `Channel` over a `ChannelAdapter`: it resolves an internal target to the platform's address, holds the reference to the conversational rules, and records the row that says the message left. An adapter reads no domain rows and holds no process container.
+- `agent/intake.rs:Intake` — the inbound tail, agent-owned because everything it reaches for is agent or domain vocabulary; a platform only reads its own updates into `agent/intake.rs:Arrival` and hands it over.
+- `platform/host.rs:{ChannelContext, ChannelRuntime}` — one channel as the host holds it: the adapter, the one inbound path, the agents living in its chats, and the token their shutdown hangs on; `ChannelRuntime::assemble` builds all of it from a platform's adapter, so that part is written once.
+
+**The declaration carries only what a reader varies with.** The send tool derives its advertised schema and its runtime validation from `ChannelCapabilities`, and that is what it holds. A field with no reader is not added — a platform's ability to deliver edits, say, is exercised by that platform's arrival mapping, not declared, and whether it shows a typing indicator is not declared either: the platform answers `Channel::start_typing` with the guard or with nothing (`agent/channel.rs:TypingGuard`).
+
+**Platform autonomy**: the agent boundary carries neutral semantics (`ChatType`, `EntryAudience`, the message text and its attachments), and the store keeps that neutral shape — a platform adapter reads its own update into it on the way in (`Arrival`, whose own fields are platform-free: extras ride in `meta`) and reports the same shape on the way out (`SentMessage`). `domain` may carry platform *variants*, but no platform crate types.
 
 ## Key data flows
 
-### Event system chain (Platform → wake → Inbox → EventScheduler → dispatch → spawn_turn)
+### Platform event to persisted events
 
 ```mermaid
 flowchart LR
-    TELE[platform/telegram/message_handler.rs<br/>dispatch_agent_event] -->|persist_user_message then persist| DB[(Postgres table)]
-    TELE -->|wake WakeEvent::new reason| INBOX[event/inbox.rs:Inbox]
-    INBOX -->|drain| LOOP[session/event_loop.rs loop<br/>scheduler.rs:EventScheduler timing decision]
-    LOOP -->|Decision::Ready| DISPATCH[session/dispatch.rs:dispatch]
-    DISPATCH -->|gather_messages since_id| DB
-    DISPATCH -->|build_prompt + emit TurnStarted| TURN[runtime/run.rs:spawn_turn]
-    RUN -->|react loop: Turn + tool calls| BUS[event/bus.rs:AgentEventBus]
-    BUS -->|50 items / 200ms batch| DB
+    D[inbound tail<br/>row + entry, one transaction] -->|1| DB[(PostgreSQL)]
+    D -->|2 doorbell| I[agent Doorbell]
+    I -->|3 re-read the accumulation| S[scheduler: timing decision]
+    S -->|4 Ready| P[dispatch: take the batch, build prompt]
+    P -->|5 spawn turn| L[Step loop: LLM + tools]
+    L -->|6 consume the batch| DB
+    L -->|7 events| BUS[event bus]
+    BUS -->|8 batched| DB
 ```
 
-1. Platform messages are **persisted before being woken**: `dispatch_agent_event` first calls `persist_user_message` (topics/platform.md "persist before wake"), then calls `session.wake(WakeEvent::new(reason))` — WakeEvent only carries a reason and is a pure notification; messages are always pulled from the DB by dispatch's `gather_messages(since_id)`
-2. `event/inbox.rs:Inbox` is a cross-thread input queue (`Arc<Mutex<Vec<WakeEvent>>>` + `tokio::sync::Notify`), `push` wakes the session loop
-3. `session/scheduler.rs:EventScheduler` only performs **timing decisions**: debounce 1.5s + Heat/Window probabilistic attention (`attention.rs`: base 0.05, spend 0.25, reset 1.0; no decay within the 30s active window after being @'d/replied) + `last_activity` independent idle timer (**only addressed events/speech refresh it, Observe does not refresh** — a pure Observe session counts idle from its creation time and can expire normally, see topics/session.md) → `Decision::{Ready, Defer, Done}`
-4. `dispatch.rs:dispatch`: build_turn_context → gather_messages → build_prompt → **stage_shown (staged retrieval injection)** → emit `TurnStarted` → `runtime.spawn_turn` (state switches to Busy, holds JoinHandle + oneshot result_rx)
-5. Turn is a react loop (`react.rs:run_react_loop`, multiple Steps + tool calls), each turn's events are persisted via `AgentEventBus`; loop termination semantics: Main mode ends on empty text + skip/no activity call, wrap-up mode stops when there are no tool calls; **Turn has three states** (Success / Steered / Failed, see topics/session.md): Success/Steered ends normally → `on_complete` advances (cursor/shown staging commit, ContextMeta update); Failed has zero state side effects (staging discarded, stays Idle waiting for the next message)
-6. `on_complete` (BusySignal::Turn/WrapUp) → conversation.update (**ContextMeta update: tokens/turn_count only advance on success; turn_count is chapter-level — reset on reopen**) → back to Idle → continue the loop; Turn/wrap-up failure stays Idle (does not exit); after idle expires the `should_wrap_up` determination decides between reopen or Exit (chapter reopen mechanism, see topics/session.md)
+The sequence carries the design: **a change is durable before anything is rung** (the row and its accumulation entry land together, so the agent always reads one state); **the scheduler only times** (it owns no side effects and never reads the database); **a Turn is the atomic unit** (the batch it took is consumed only if it ends normally, so a failure needs no repair); and **events are batched out of band**, so auditing never blocks a reply.
 
-### Event definition & persistence
+### Event system
 
-- The enum is **defined in `domain/vo/event.rs`**: `AgentEventPayload` (`#[serde(tag = "event", rename_all = "kebab-case")]`, 9 variants), `AgentEvent{chat_id, payload}` + `to_json_value()` (serialization failure → Null + warn) — see that file for the variant list; here we only record the semantics that cannot be read from the code
-- `agent/runtime/event/bus.rs:AgentEventBus`: re-exports the enum; `emit` → unbounded channel → collector persists to DB in batches (`FLUSH_BATCH=50` items or `FLUSH_INTERVAL=200ms`) into the `event` table (`domain="agent"` constant value)
-- Event table structure: `seq` (I64 auto PK) / `domain` (Text) / `payload` (JSONB) / `created_at` — **no standalone chat_id/kind column**, chat_id lives inside the payload JSON; JSONB filtering directly uses `payload->>'chat_id'` / `payload->'payload'->>'event'` (TEXT→JSONB migration already done, see topics/cli.md)
+- `domain/vo/event.rs:AgentEventPayload` is the typed payload enum (serde tag `event`, kebab-case names); `AgentEvent` adds the chat id and serializes into the table.
+- `agent/runtime/event/bus.rs:AgentEventBus` buffers emissions and flushes them in batches into the `event` table under the domain `agent`. The table has no chat or kind column: both live inside the JSONB payload, which is what the query indexes are built on.
+- Two Event semantics matter beyond their names. `ModelRetry{ResponseWithText}` is **not** a retry — it records a speaking-contract violation and the loop continues; only timeouts and unparsable responses are actually retried. And the wrap-up events bracket the retention pass, with `WrapUpCompleted` carrying the wrapped chapter's Step count, the pass's own context tokens and its summary.
+- `cli/display.rs:tag_for_kind` names the display tag of a payload — an exhaustive `match`, so a new variant fails to compile; the TUI and the `--kind` filter read the same `EventKind::as_str()`, so there is no second hand-written map to keep in step.
 
-Variant semantics key points (behavior that cannot be read from code; check before changing the event structure):
+### Two HTTP clients
 
-- `StepCompleted` is emitted each Step; `TurnEnded.output` is the StepOutput of the last step
-- `ModelRetry{ResponseWithText}` is **not a retry**: it injects `DIRECT_OUTPUT_ERROR` and continues the loop (react.rs); the only real retry is `TimeoutRetry` (Reqwest timeout/connect, at most 2 times, backoff 500ms×attempt)
-- `WrapUpStarted` = the retention that starts before a chapter reopen; `WrapUpCompleted.turns_count` = the number of turns before wrap-up (after reopen `start_new_chapter` zeroes ContextMeta + clears shown ids, naturally preventing repeated wrap-ups); `WrapUpFailed{error}` = retention failure, a clean chapter is reopened after the event (topics/session.md)
-- CLI/TUI event tag mapping: TURN/TOOL/STEP/DONE/RETRY/FAIL/STEER/WRAP (`cli/display.rs:tag_for_kind` + `KIND_TAGS`; WRAP covers wrap-up-started and wrap-up-completed — the storage layer only has the single turn-ended tag, FAIL/STEER are currently filtered and equivalent to DONE, see topics/cli.md pitfalls)
-
-### Dual-client strategy
-
-| Purpose | Client | Reason |
+| Path | Client | Why |
 |---|---|---|
-| Main conversation | genai `create_genai_client` (adapter system; AzureOpenAI/Phind/Requesty → OpenAI compatible) | Covers multi-provider adaptation |
-| embedding / TTS / multimodal | self-developed `agentcore::ApiClient` (OpenAI-compatible REST: chat/completions, embeddings, audio/speech) | Covers tooling endpoints, controllable |
+| Main conversation | genai (`agentcore/provider.rs:create_genai_client`) | multi-provider adaptation, including the adapters for OpenAI-compatible vendors |
+| Embedding, speech, multimodal, image generation, rerank | `agentcore::ApiClient` | a small REST client for the tooling endpoints, under the project's own control |
 
-### Error handling system
+### Errors
 
-Error shapes and conventions (`AppError{kind, message, source}` single type + `register_errors!` centralized From, `?` preferred / `let _` only for best-effort / `if let Err(e)` warn) see docs/topics/config.md "Error handling system"; the domain service "swallow-error pattern" see docs/topics/domain.md pitfalls (`ConversationRecordService::get` already fixed per contract).
+One `AppError` enum, no codes or families, boundaries consuming the display string — the shape and its conventions are in `docs/topics/config.md`.
 
-## Module navigation
+## Module map
 
-| Module | Key files | Responsibility |
-|---|---|---|
-| app/ | mod.rs, context.rs | Assembly root: log initialization → AppContext → AgentEngine → spawn_bots → ctrl_c |
-| platform/ | manager.rs, telegram/ (11 files) | Platform integration: teloxide Dispatcher + PlatformHandler/ContentParser implementations |
-| agent/ | runtime/, context/, tools/, multimodal/, node/, personality/ | Session/scheduling/run loop/context rendering/tool set/multimodal |
-| agentcore/ | tool.rs, mcp.rs, provider.rs, apiclient.rs, embedding.rs, skills/, render/ | Core library: tool abstraction, MCP integration, provider client, skills, XML rendering (zero agent/domain dependencies) |
-| domain/ | model/, repo/, service/, vo/, db.rs | Data layer: 13-table model + repo (sqlx) + service + event VO |
-| config/ | schema.rs, manager.rs, provider_manager.rs, paths.rs, env.rs | Pure data config (Patch style) + file→env merge + provider resolution |
-| cli/ | cli.rs, display.rs, tui/, kb.rs, log.rs | Command surface: config/db/log/kb subcommands + event log TUI |
-| Underlying | error.rs, util/, infra/ | Single error type, pgvector/url/path utilities, FileCache |
+| Module | Responsibility |
+|---|---|
+| app/ | composition root: logging, bot startup and shutdown orchestration |
+| platform/ | channel lifecycle host and what it keeps per channel (`platform/host.rs:ChannelContext`), the outbound recorder, and each platform's adapter (the Telegram module: dispatcher, arrival mapping — the only place an update becomes an `Arrival` — command spelling, menu, config, wire impl, forms, receipts, reply resolution, file access, send service) |
+| agent/ | ChatAgent and scheduling, the Step loop, roles, context rendering, the command table and host copy, tools, multimodal, the analysis pipeline, the sandbox, networking — and the process container (`agent/runtime/context.rs:AppContext`) |
+| agentcore/ | core library: tool abstraction, MCP, provider clients, the model-kind table (which protocol each kind speaks), skills, XML rendering |
+| domain/ | data layer: models, repos (including the runtime embedding columns), services, value objects, the schema |
+| config/ | pure data configuration, file and environment merging, the `[model-roles]` table, provider resolution |
+| cli/ | command surface and the event-log TUI |
+| util/ error.rs | text helpers and the file cache, the single error type |
 
-## Evolution direction
+## Evolution Direction
 
-- **Eliminate the agentcore → config one-way dependency**: `agentcore/mcp.rs` reads McpConfig — move the MCP config section down into agentcore or inject it via a trait, removing the last reference to config (the original agentcore↔config cycle was already broken when ProviderKind moved down into agentcore)
-- **Fix known violation 1**: the `domain/service/mod.rs` → `agent::multimodal::MultimodalService` dependency — move MultimodalService down into agentcore or isolate it through the embedding trait
-- **Startup scan interface**: chapter reopen does not do a startup-phase scan for "chats with no new messages after restart" (the spec leaves the interface open) — add a background scan component when needed (throttled to prevent startup storms)
-- **Multi-platform extension**: PlatformHandler/ContentParser traits are already isolated, adding a new platform only requires implementing the two traits
+- **Startup scan**: reopen chapters that are overdue while idle, with throttling (the interface is left open today).
+- **New platform**: a `platform/<name>/` submodule whose adapter implements `platform/adapter.rs:ChannelAdapter` — which includes the inbound half (`agent/channel.rs:ChannelAccess`), so no glue is needed — its declaration, the update stream read into `agent/intake.rs:Arrival`, the send calls answering with a `platform/adapter.rs:SentMessage`, host copy, and file access — plus its own config struct parsed from its `[channel.<name>]` section; one arm in `platform/host.rs:ChannelHost::spawn_all`; and one variant in `domain/model/account.rs:Platform`. Nothing in `agent/` and nothing else in `domain/` changes: admission, the command fork, ingest and the doorbell are the shared tail's (`agent/intake.rs:Intake`), and the sent row is the shared recorder's.
+- **Crate split**: not now — one process and no external consumer of the library surface. Revisit when compile time degrades or a second process needs `domain`/`agentcore` at crate granularity.
+- **Deliberately deferred, not to be fixed opportunistically**: the event tag spellings living in three places; a row and its vector still written non-atomically on the perception path (it is a cache and that write is best-effort by design, `docs/topics/domain.md`); and the hand-written JSON keys in the conversation snapshot.

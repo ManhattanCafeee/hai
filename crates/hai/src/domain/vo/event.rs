@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use strum::{Display, EnumString, IntoStaticStr};
+use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
-use super::{ChatId, StepNumber, TurnNumber};
+use super::{ChatEntry, ChatId, EntryAudience, StepNumber, TurnNumber};
 
-/// 一次 LLM 调用的输出（Step 级；运行期记录，审计走 events 表）。
+/// Output of one LLM call; a runtime record, the audit trail lives in the `event` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepOutput {
     pub turn: TurnNumber,
@@ -30,11 +30,10 @@ impl AgentEvent {
     }
 }
 
-/// Turn 结束原因（三态定案映射；TurnEnded 唯一结束事件）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TurnEndReason {
-    /// 正常完成（含无发言/无活动）。
+    /// Completed normally, including turns that had nothing to say.
     Success {
         output: StepOutput,
         tool_calls: usize,
@@ -42,7 +41,8 @@ pub enum TurnEndReason {
         context_tokens: u32,
         has_spoken: bool,
     },
-    /// 新事件打断（steering）：提前正常结束，已处理内容生效，立即增量续跑新 Turn。
+    /// Interrupted by a new event: the Turn ends early with its work kept, and a new Turn
+    /// resumes from there.
     Steered {
         output: StepOutput,
         tool_calls: usize,
@@ -50,19 +50,58 @@ pub enum TurnEndReason {
         context_tokens: u32,
         has_spoken: bool,
     },
-    /// 异常——零状态副作用，唯一重来路径。
+    /// Failure with zero state side effects; the only path that redoes the Turn from scratch.
     Failed { error: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, IntoStaticStr)]
-#[serde(tag = "event", rename_all = "kebab-case")]
+/// What let a turn through: the two attention paths the scheduler decides, the retry a failed turn
+/// left behind (which bypasses attention), and the re-dispatch a steered turn starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr, EnumIter)]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
+pub enum StartedBy {
+    Window,
+    Heat,
+    Retry,
+    Steered,
+}
+
+/// The batch a turn read, counted by the audience the attention policy reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchComposition {
+    pub addressed: u32,
+    pub bystanders: u32,
+}
+
+impl BatchComposition {
+    pub fn of(entries: &[ChatEntry]) -> Self {
+        entries.iter().fold(
+            Self {
+                addressed: 0,
+                bystanders: 0,
+            },
+            |mut counts, entry| {
+                match entry.audience {
+                    EntryAudience::Agent => counts.addressed += 1,
+                    EntryAudience::Bystanders => counts.bystanders += 1,
+                }
+                counts
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
 pub enum AgentEventPayload {
+    /// `started_by` and `composition` are absent on records written before those fields existed.
     TurnStarted {
         turn: TurnNumber,
-        reason: String,
+        reason: WakeReasonKind,
         msg_count: usize,
         full_prompt: String,
+        started_by: Option<StartedBy>,
+        composition: Option<BatchComposition>,
     },
 
     ToolCall {
@@ -95,40 +134,142 @@ pub enum AgentEventPayload {
         reason: ModelRetryReason,
     },
 
-    /// 章节收尾开始（重开前置留存启动）。
-    #[serde(alias = "compact-started")]
     WrapUpStarted,
 
-    /// 章节收尾完成。`summary` = 留存摘要全文（旧事件无此字段，default 空串）。
-    #[serde(alias = "compact-completed")]
     WrapUpCompleted {
-        /// 被收尾章节的 Step 数（收尾前取值）；旧事件缺此字段时默认 0（兼容历史行）
         #[serde(default)]
         step_count: usize,
-        /// 留存摘要（置入新章节开头；旧事件为空串）
+        /// The pass's last Step's prompt tokens, not the wrapped chapter's.
+        #[serde(default)]
+        context_tokens: u32,
         #[serde(default)]
         summary: String,
     },
 
-    /// 章节收尾失败。`error` = 失败原因（无摘要 / 生成错误），事件后重开干净章节。
-    #[serde(alias = "compact-failed")]
-    WrapUpFailed { error: String },
+    WrapUpFailed {
+        error: String,
+    },
 }
 
 impl AgentEventPayload {
-    pub fn kind(&self) -> &'static str {
+    /// The kind this payload is stored as. Adding a variant fails to compile until it is named here,
+    /// which is what keeps the two spellings of one vocabulary from drifting apart.
+    pub fn kind(&self) -> EventKind {
+        match self {
+            Self::TurnStarted { .. } => EventKind::TurnStarted,
+            Self::ToolCall { .. } => EventKind::ToolCall,
+            Self::ToolCallResult { .. } => EventKind::ToolCallResult,
+            Self::StepCompleted { .. } => EventKind::StepCompleted,
+            Self::TurnEnded { .. } => EventKind::TurnEnded,
+            Self::ModelRetry { .. } => EventKind::ModelRetry,
+            Self::WrapUpStarted => EventKind::WrapUpStarted,
+            Self::WrapUpCompleted { .. } => EventKind::WrapUpCompleted,
+            Self::WrapUpFailed { .. } => EventKind::WrapUpFailed,
+        }
+    }
+}
+
+/// One event kind as the `event` table stores it: the serde tag of [`AgentEventPayload`], spelled
+/// once, so a filter names a kind instead of carrying a bare string.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Display,
+    Serialize,
+    Deserialize,
+    IntoStaticStr,
+    EnumString,
+    EnumIter,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum EventKind {
+    TurnStarted,
+    ToolCall,
+    ToolCallResult,
+    StepCompleted,
+    TurnEnded,
+    ModelRetry,
+    WrapUpStarted,
+    WrapUpCompleted,
+    WrapUpFailed,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
         self.into()
     }
 }
 
+/// Why a Turn started, without the wake's payload: what a `TurnStarted` record stores and what
+/// `hai log` shows. A stored record may spell a variant as its own name or in `snake_case`; the
+/// write path emits the `snake_case` one, and both decode.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Display, IntoStaticStr, EnumString,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Display,
+    Serialize,
+    Deserialize,
+    IntoStaticStr,
+    EnumString,
+    EnumIter,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum WakeReasonKind {
+    #[serde(alias = "Observe")]
+    Observe,
+    #[serde(alias = "Direct")]
+    Direct,
+    #[serde(alias = "Mention")]
+    Mention,
+    #[serde(alias = "Scheduled")]
+    Scheduled,
+    #[serde(alias = "Command")]
+    Command,
+}
+
+impl WakeReasonKind {
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// How much of the agent's attention the reason asks for: a change aimed at the agent outranks
+    /// a room it was only listening to, and an instruction it has to carry out outranks both.
+    pub fn strength(self) -> u8 {
+        match self {
+            Self::Command | Self::Scheduled => 2,
+            Self::Direct | Self::Mention => 1,
+            Self::Observe => 0,
+        }
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Display,
+    IntoStaticStr,
+    EnumString,
+    EnumIter,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
 pub enum ModelRetryReason {
-    /// 模型直接输出了文本但没有调用工具（发言契约违规：文本必须配 skip/send_message）
     ResponseWithText,
-    /// Reqwest 网络超时 / 连接失败（真重试，最多 2 次退避）
     TimeoutRetry,
+    /// HTTP 200 whose body is not parseable JSON (transient proxy or gateway output).
+    MalformedResponse,
 }

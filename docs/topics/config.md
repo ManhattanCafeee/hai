@@ -1,78 +1,107 @@
-# Config and Error Handling
+# Config and error handling
 
-> Config override chain, structure semantics, Paths, Provider resolution, and the error type system. A must-read when modifying the `config/`, `error.rs`, or `app/context.rs` assembly.
+> How the config is loaded, model-role and provider/channel resolution, Paths, and the error type. Read before changing `config/`, `error.rs` or the container in `agent/runtime/context.rs`.
 
 ## Overview
 
-Config is a pure data layer (+ ProviderRegistry resolution), and app is the assembly root. This document covers "where the config comes from, its structure semantics, and who consumes it" and "how errors are expressed" (field authority is in config/schema.rs). See the "Error shape" section for error handling.
+`config` is a data layer plus provider resolution; `config/load.rs:AppConfig::load` resolves the sources once at startup into a plain value, and `agent/runtime/context.rs:AppContext` turns that value into the process context. Nothing writes the config file back and nothing reloads it, so a setting that changes at runtime belongs to the database (`domain/service/preference.rs`) and is reached through `agent/settings.rs:Settings`, not here.
 
 ## Design
 
-### Config override chain
+### The override chain
 
-```txt
-.hai/config.toml → HAI_ env vars (prefix "HAI", separator "__" — config-rs prefixes include the separator, so **the actual prefix is the double underscore `HAI__`**: `HAI__AGENT__MAX_TOKENS` takes effect, whereas `HAI_AGENT__MAX_TOKENS` is silently skipped)
+```mermaid
+flowchart LR
+  defaults[AppConfig::default] --> load
+  file["config.toml in the config dir"] --> load
+  env["HAI__* environment"] --> load
+  load["config/load.rs:AppConfig::load"] --> resolved[resolved AppConfig]
 ```
 
-- **"Runtime hot reload" is not wired up**: `Config::reload()/update()/save()` have zero callers and no file watcher; what actually takes effect is a one-time file→env merge at startup (`config/manager.rs:rebuild_and_store`: `T::default().apply(file_intent).apply(env_intent)`, env overrides file)
-- The `HAI_LOCAL_MODE` environment variable takes effect **by existence alone** (value ignored, `config/env.rs:local_mode`), forcing `.hai/`; otherwise it falls back to `$XDG_CONFIG_HOME/hai/`
-- Patch boundary: sections that can be hot-updated (agent/auxiliary/mcp/database/sandbox/knowledge) get `#[derive(Patch)]`; the non-Patch ones (ProviderConfig/BotConfigRaw/SkillsConfig/LoggingConfig) are startup-only, one-time config
+`cli.rs:Cli::execute` calls it once, before any command runs, and passes the value down; a missing config file is the defaults, and a parse failure or an unreadable file fails startup.
 
-Key symbols: `config/manager.rs:Configurable` + `Config<T>{file_path, intent, env_intent, current}` (ArcSwap), `config/env.rs:ENV_PREFIX = "HAI"`, `config/meta.rs:AGENT_NAME`.
+- **The sources merge key by key.** A key set by a later source wins, every other key keeps its earlier value, and a section no source mentions comes from `AppConfig`'s `Default`. `HAI__MODEL_ROLES__DEFAULT__MAX_TOKENS` therefore leaves the file's other `[model-roles.default]` fields alone.
+- **Environment naming**: the separator is part of the prefix, so a key must start with `HAI__` (`HAI_MODELS__DEFAULT__MAX_TOKENS` is skipped), and each `__` segment is lowercased and kebab-cased to match `rename_all = "kebab-case"` (`HAI__MODEL_ROLES__DEFAULT__MAX_TOKENS` → `model-roles.default.max-tokens`). An unknown `HAI__*` variable fails startup like an unknown file key.
+- **`.env`** sits in the config directory (`config/paths.rs:Paths::env_file`) and loads before the config file: a missing file skips, a malformed line fails startup, and `dotenvy` never overwrites a set variable — the real environment outranks it.
+- **Provider credentials come from a source of their own**: an unprefixed variable (`OPENROUTER_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, …) is read at provider resolution, not by config-rs, and it outranks the file's `api-key` (`config/provider_manager.rs:ProviderRegistry::discover`; see *Provider availability*).
 
-### Paths singleton
+### Paths
 
-`config/paths.rs:Paths::inferred() -> &'static Self` (OnceLock, resolved once at process startup). Fields:
+Every path derives from `config/paths.rs:Paths::inferred()`, resolved once per process (`OnceLock`). `.hai/` wins when it exists or `HAI_LOCAL_MODE` is set (presence alone, the value is ignored), otherwise the XDG directories.
 
-- `config_dir` / `data_dir`: `.hai/` or `$XDG_CONFIG_HOME/hai/` / `$XDG_DATA_HOME/hai/`
-- `config_file` / `config_file_str`: config_dir + "config.toml" (pre-cached UTF-8, expects valid UTF-8)
-- `file_cache_dir`: data_dir + "files"
-- `skill_dirs`: `[config_dir/skills, .hai/skills (deduped), .agents/skills]` retain(exists)
+### Model roles
 
-`resolve()` decides: `.hai/` exists or `HAI_LOCAL_MODE` is set → local mode; `dirs::config_dir/data_dir` as fallback.
+`[model-roles]` selects a model per ModelRole and nothing else: one block per role, each naming the `[providers.*]` entry it runs on (see *Provider availability*; a block that omits `provider` falls back to the `default` role's, `rerank` included), a model slug, an optional `base-url` when the model lives elsewhere, and the parameters of that call — the chat block's `max-tokens`/`temperature`/`reasoning`, `speech`'s `voice`/`speed`. How HAI behaves around a model is not here: the analysis switches and templates are `[agent.multimodal]`, the retrieval budgets `[agent.retrieval]`; the embedding vectors' width is `dimension` in the embedding block, which the block must state.
 
-### Config structure essentials (field authority = `config/schema.rs`)
+What a block-less or model-less role means is one of three policies (`config/model_role.rs:resolve`). An inheriting role (`vision`, which also serves video, and `transcription`) runs on the main model when its block is absent — endpoint included — and stays off when that provider cannot read the media, since the user never declared it; a block it does declare keeps its own provider and `base-url` but still reads the main model. A dedicated role (`speech`, `image`, `rerank`) exists only when its block names a model. A required role fails startup on an empty model: `default`, because a Step loop without a chat model is nothing, and `embedding`, because memory and retrieval depend on it.
 
-> The complete field list, default values, and inline comments are authoritative in `config/schema.rs` (grep to find them) — this section only records the structure semantics that are not readable from the code.
+`rerank` scores retrieval candidates. The block names the model slug, and its provider when the `default` role's is not the one to serve that kind; which endpoint the kind lives at comes from the provider — `agentcore/provider.rs:ProviderKind::endpoint_for` gives `openrouter` `https://openrouter.ai/api/v1/rerank`, where its dedicated cross-encoders (`cohere/rerank-4-fast`, `voyageai/rerank-2.5`, …) answer. A provider that serves no rerank kind makes `config/model_role.rs:resolve` fail startup rather than guess; a self-hosted reranker is a block `base-url` (the whole endpoint, e.g. `http://127.0.0.1:8080/v1/rerank`). `[agent.retrieval]` bounds one request from two sides, and a `config/schema.rs` test pins the shipped defaults against the corpus (`chunk-size`) and the model window; a candidate longer than `candidate-chars` is scored on its head, while what reaches the model stays whole, so the caps are a guard against a pathological row rather than a trim of normal ones. An absent block disables reranking rather than substituting an approximation, so retrieval keeps the fusion order (`docs/topics/domain.md`).
 
-- **Patch boundary**: sections that can be hot-updated (agent/auxiliary/mcp/database/sandbox/knowledge) get `#[derive(Patch)]`; the non-Patch ProviderConfig/BotConfigRaw/SkillsConfig/LoggingConfig are startup-only, one-time config
-- **Default inheritance and clamp**: `[auxiliary.embedding]` dimension defaults to 1024; `[auxiliary.tts]` voice defaults to "alloy" and speed is clamped to (0.25, 4.0); `[auxiliary.vision]`/`[auxiliary.audio]` enabled = feature switch (default true); `[bot.*]` rich-message defaults to true
-- **Model roles (auxiliary)**: one block per capability = model + capability parameters (`auxiliary.{vision,audio,tts,embedding,image-gen}` — each block's `provider` defaults to `agent.provider`). Comprehension classes (vision/audio): model defaults to delegating to the main model (agent) + enabled switch (default true) + analysis prompt override (image-prompt/video-prompt/prompt — empty = built-in template). Dedicated classes (tts/embedding/image-gen): model defaults to capability unavailable (embedding is a required capability — defaulting to it raises an error, contract-style failure). image-gen is a general capability: the tool accepts a list of reference images (image-to-image / multi-image composition, e.g. "replace the person in image 1 with the person in image 2"; the API goes through chat/completions + modalities image form — mainstream image models such as nano banana all support reference image input).
-- **Cross-document semantics**: the scheduling semantics for wrap-up-token-threshold / base-attention / window-secs are in docs/topics/session.md; the three chunk parameters and `[knowledge.inject]` are in docs/topics/domain.md + docs/topics/prompting.md; the participation rules for image-prompt/prompt are in docs/topics/tools.md
+### The chat's language
 
-### Provider/Bot resolution
+`[agent] language` is what a chat speaks in when the chat never chose (`docs/topics/prompting.md`); `/lang` writes the per-chat value that overrides it, and `agent/settings.rs:Settings::language` is the one place the two are resolved. The value selects the built-in prompt text set, so Chinese reads the Chinese layers and every other language reads the English ones among `soul` and `group` (the `private` layer has no built-in text) — which is why only the Chinese set needs its own text. The operational `agents` and retention `wrap-up` layers are English-only.
 
-**Provider**:
+### Provider availability
 
-- `config/schema.rs:ProviderConfig::infer_kind(name)`: the `type` field takes priority, otherwise `ProviderKind::from_str(name)` (invalid → Config error)
-- `config/provider_manager.rs:ProviderRegistry::new(&AppConfig)` resolves them one by one; `get_checked` (NotFound → "Provider 'x' not found"); `get_endpoint(provider, model) -> Endpoint{base_url, api_key, model}`
-- `agentcore/provider.rs:ProviderKind` (12 variants) + `create_genai_client(&ProviderEntry)` (adapters: AzureOpenAI/Phind/Requesty → OpenAI-compatible; Google → Gemini; XAI → Xai)
-- Consumers: `app/context.rs` (AppContext assembly + MultimodalService::from_config), `rebuild.rs` (get_endpoint), `agent/runtime/engine.rs` (create_genai_client), `cli/kb.rs` (build_services)
+A `[providers.<name>]` block declares an **override** — transport (`type`), endpoint (`base-url`), credential (`api-key`), extra `headers` — not the provider's existence. Availability is resolved from the environment at startup (`config/provider_manager.rs:ProviderRegistry::discover`) for every name the config mentions: the declared block names plus what the `[model-roles.*]` blocks name (`config/model_role.rs:providers_named`).
 
-**Bot**:
+| Evidence | Available |
+|---|---|
+| a credential — `env[<KIND>_API_KEY]`, else the block's `api-key` | yes |
+| the block declares its own `base-url` | yes, taken at its word; no probe |
+| no credential, no `base-url`, the kind is keyless (`ollama`) | yes when the kind's endpoint answers a TCP connection (1s timeout) |
+| no credential, no `base-url`, the kind needs one | no: `[providers.openai] needs an api-key: set \`api-key\` here or OPENAI_API_KEY` |
+| a kind with no shared root (`azureopenai`) and no `base-url` | no: `[providers.azureopenai] has no endpoint: set \`base-url\` here` |
+| a name that is neither a kind nor a declared block | no: `[providers.nope] is not a supported provider: …` |
 
-- `config/schema.rs:BotConfig::resolve(key, raw)`: type takes priority, else the key name → `BotConfig{key, platform, bot_token, allowed_chat_ids, rich_message}`; `BotPlatform` is Telegram only
-- Startup: `platform/manager.rs:spawn_bots` iterates `cfg.bot`, each bot gets its own SessionManager + dispatcher; the JoinHandle is dropped (a crash is only logged)
+`[model-roles.default] provider = "ollama"` therefore works with no block at all while the service runs, and `OPENROUTER_API_KEY` alone is a complete openrouter setup. Unavailability fails startup where the provider is named (`agent/runtime/context.rs:assemble`); a declared block nothing references is never consulted.
 
-### Error handling (error.rs)
+A block states an endpoint (`base-url`) rather than proving one, so a self-hosted gateway with no credential stays available on its word — only the endpoint HAI assumes for a keyless kind is probed.
 
-- **Error shape**: `error.rs:AppError{kind, message, source}` single type + `register_errors!` centralized From registrations
-- Conventions: `?` takes priority; `let _` only for confirming something is irrelevant; `if let Err(e) = ... { tracing::warn!(?e, ...) }` (the same hard rule is in AGENTS.md §1)
-- Known tension: several domain services' `get_*` swallow errors as `Ok(None)`, so callers cannot distinguish them — see the "swallow-error mode" pitfall in docs/topics/domain.md; do not spread it
+### Model kinds
+
+A ModelRole asks a provider for one **model kind** (`agentcore/model_kind.rs:ModelKind`): `chat` (the Step loop's conversation), `vision` (an attached image or video), `transcription` (an audio clip), `embedding`, `image` (generation), `speech` (synthesis), `rerank`. A model kind is one endpoint class of a provider, and the role names it — no protocol key is stated twice.
+
+Which model kinds a provider serves, and where each one lives, is the provider kind's own answer (`agentcore/provider.rs:ProviderKind::endpoint_for`): the non-chat kinds sit at the provider's base URL, and `openrouter` additionally serves `rerank` at its own absolute URL, which is why a proxied `base-url` moves the chat and not the reranker. A kind answers only what it can actually speak — `openrouter` all seven; `openai` chat, vision, transcription, embedding and speech; `ollama` chat, vision, transcription and embedding; every other kind chat and vision/transcription alone unless its chat transport is not the OpenAI shape (`anthropic`, `google`, `azureopenai` read no attached media this way, and no `base-url` is assumed for `azureopenai`: its block must state one).
+
+A block that states its own `base-url` is taken at its word; otherwise the provider has to serve the kind, and failing that startup reports which block asked for what (`config/provider_manager.rs:ProviderRegistry::endpoint`). `[providers.<name>]` carries the chat root (`base-url`), the kind (`type`, optional — a provider that serves only one non-chat kind names none), extra `headers`, which ride on every kind of that provider, and a credential of its own (`api-key`) when the environment is not the source.
+
+### Behaviour settings
+
+- `[agent.multimodal.vision]` / `[agent.multimodal.transcription]`: `enabled` and the analysis templates (`image-prompt`, `video-prompt`, `prompt`) that the understanding roles send; the built-in templates are transcription instructions for a reader that cannot see or hear the original. `[agent.multimodal] inline-max-bytes` bounds the bytes one analysis may carry inline (default 20 MB, `0` unbounded): it is the provider's request limit, so a larger file is refused instead of sent.
+- `[sandbox]`: the environment `read` and `bash` act on. `enabled` (default true) chooses the container or the host, `runtime` (`docker`/`podman`, detected when unstated) and `image` say what to start, `timeout-secs` bounds one operation, and `mounts` lists extra directories bound read-only into the container at their own paths (the skill roots are always mounted, and the chat's workspace is the one writable place). A mount that is not an absolute existing path fails startup, and `read` — which walks the host's own filesystem — may open the workspace plus those mounts, nothing else.
+- `[agent.retrieval]`: `candidates` and `candidate-chars` (what one rerank request carries) and `timeout-secs`.
+- `[model-roles.embedding] dimension`: the width of every vector column, which the block must state; `hai db migrate` refuses a populated column it cannot convert and points at `hai db rebuild embeddings`, which rewrites the table.
+
+### Providers and channels
+
+Both resolve once through `config/provider_manager.rs:ProviderRegistry::discover`: which names exist and which are usable (see *Provider availability*), then the entries themselves, from `type` when present and otherwise from the entry name; a name that is not a transport leaves the entry without a kind, which only a kind the block declares can serve. The registry hands out `ModelTarget{base_url, model, credential, headers}` per model kind; `agentcore/provider.rs:create_genai_client` builds one genai client per entry for its chat kind. A `[channel.<name>]` section is neutral to the config layer: `platform/host.rs:ChannelHost::spawn_all` takes its platform from its `type` key or from its own name (`domain/model/account.rs:Platform`, parsed from that spelling, failing startup with the supported names), and the platform that claims it parses and validates its remaining keys (`platform/telegram/config.rs:TelegramConfig::parse`: an empty `bot-token` fails startup, empty `allowed-chat-ids` only warns, and that channel then rejects every chat). Each channel gets a supervisor and an AgentRegistry, and a spawn that fails fails startup.
+
+### Error handling
+
+- **Shape**: one `AppError` enum (`thiserror`, `#[non_exhaustive]`) — a local `Message(String)` plus typed `#[from]` source variants, `AppError::message(…)` as the only constructor and `bail!` as the early-return macro. A platform's own wire failure reaches it through one neutral arm, `AppError::Adapter { platform, source }` (`AppError::adapter`), so no vendor error type enters the enum and a second platform adds no variant here.
+- **Location**: a config problem is a `config/issue.rs:ConfigIssue`, rendered `[<toml path>] <detail>`; the path is derived — a model role's block from its `ModelKind` (`ConfigIssue::model_role`), a provider's from its name (`ConfigIssue::provider`) — so the role and provider paths are derived rather than hand-written, while what `AppConfig::validate` reports names its own key (`knowledge.chunk-max`).
+- **No codes, no families**: boundaries consume `Display` only — logs, the event payloads (`TurnEndReason::Failed`, `WrapUpFailed`), the CLI TUI and `agentcore/tool/mod.rs:ToolError`, a string wrapper. Classification belongs at the boundary, not in the enum.
+- **Source chain**: `#[error(transparent)]` forwards the message but hands `source()` to the inner error, so the inner error never appears in the chain; `#[error("{0}")]` keeps it.
+- **Conventions**: `?` first; context folded into the message where the error is raised (`format!("…: {e}")`); `let _ =` only where the result is provably irrelevant; `if let Err(e) = … { tracing::warn!(?e, …) }` for best-effort steps.
 
 ## Boundaries
 
-- The field-level config list is not repeated here (config/schema.rs is the field authority)
-- No config hot reload (currently not wired up; see evolution direction below)
-- Provider/bot resolution is startup-only, one-time (non-Patch)
+- Field lists, defaults and clamps live in `config/schema.rs`, not here; an invariant that spans fields (a chunk budget of at least one, `knowledge.chunk-max` / `chunk-size`) is checked by `config/load.rs:AppConfig::validate` right after deserialization, and reported as a `ConfigIssue` like any other config problem.
+- `[web]` and the `[tools] disabled` switch are tool-layer semantics: `docs/topics/tools.md`.
+- Nothing here is writable or reloadable: `config/load.rs:AppConfig::load` is the only entry point, nothing writes the file back, and every resolution below it is startup-only.
+
+## Trade-offs and Reasons
+
+- **config-rs over hand-rolled merging**: its `Environment` source applies the `HAI__` prefix, the `__` separator and the kebab-case conversion, merges the sources key by key, and coerces a value to the type of the field it lands in. It also hands unknown keys to serde, so `AppConfig`'s `deny_unknown_fields` still fails startup on a stale key — a hand-rolled merge would have to reproduce all of that, string-to-number coercion included.
 
 ## Pitfalls / common mistakes
 
-- `AgentConfig` derives Default (empty provider/model strings) — `ProviderRegistry::new` will fail with a Config error when inference from the key name fails; the normal path relies on config.toml, so do not assume `default()` is directly usable
-- `config/schema.rs:ContainerRuntime::detect` runs `which` on every Default call (including the serde default path); watch the overhead when taking defaults frequently
-- `[sandbox] runtime` has no "auto" enum value — to probe, **omit the field** (go through Default::detect)
-- Leftovers: the hot-reload APIs have no callers (`Config::save` only supports json, the "toml" branch is commented out); `AgentContext.current_model` is not kept in sync with config hot updates ([INFERENCE])
-
-## Evolution direction
-
-- Wire up config hot reload (enable reload/update/save + file watching) — the API is ready now but has no callers
+- **Case conversion applies to map keys too**: `[providers.my_provider]` and `HAI__PROVIDERS__MY_PROVIDER__API_KEY` are two keys, so the variable configures nothing and leaves a stray entry that fails provider resolution at startup. Keep map keys single-word or kebab-case.
+- **Two spellings of one key collapse** (`HAI__X__A_B` and `HAI__X__A-B` reach the same field) and the winner follows process-environment order — pick one spelling.
+- **Environment overrides carry scalars only**: a sequence-valued key (`HAI__TOOLS__DISABLED=a,b`) fails startup with `invalid type: string "a,b", expected a sequence` — put lists in the config file.
+- **`.env` is read after `Paths::inferred()`**, so a `HAI_LOCAL_MODE` inside it cannot influence path resolution; set that variable in the real environment.
+- **A provider's variable is not a config key**: `OPENROUTER_API_KEY` is read by the registry, never by config-rs, so it does not show up in `hai config`, and an empty value counts as unset — a credential cannot be inherited by leaving the variable blank.
+- **A bare `[providers.<name>]` block is not a way to declare a provider**: for a cloud kind it is unavailable unless a credential exists somewhere, so a credential-less local endpoint has to state its `base-url`.
+- **A keyless kind with no `base-url` is probed at startup**: one TCP connection (1s timeout) decides availability, so an ollama that is not running fails startup where it is named (`[providers.ollama] is not reachable at http://localhost:11434/v1`) instead of failing at the first message. Reachability is the port answering, not the model being pulled.
+- **`[model-roles.speech] voice` is model-scoped, not config-scoped**: an empty voice with a configured model fails startup, and a name outside the model's table (`alloy` is OpenAI, Gemini wants `Zephyr`/`Kore`/…) comes back as a bare HTTP 400 at send time.

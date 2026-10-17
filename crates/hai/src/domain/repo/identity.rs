@@ -1,8 +1,10 @@
 use serde_json::Value;
 use sqlx::PgPool;
-use uuid::Uuid;
 
-use crate::{domain::model::Identity, error::Result};
+use crate::{
+    domain::{model::Identity, vo::IdentityId},
+    error::Result,
+};
 
 #[derive(Debug, Clone)]
 pub struct IdentityRepo {
@@ -16,7 +18,7 @@ impl IdentityRepo {
 
     pub async fn create(
         &self,
-        id: Uuid,
+        id: IdentityId,
         name: Option<&str>,
         meta: Option<Value>,
         created_at: jiff::Timestamp,
@@ -26,7 +28,7 @@ impl IdentityRepo {
             "INSERT INTO identity (id, name, meta, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5) RETURNING *",
         )
-        .bind(id)
+        .bind(id.0)
         .bind(name)
         .bind(meta)
         .bind(jiff_sqlx::Timestamp::from(created_at))

@@ -3,18 +3,10 @@ use std::time::{Duration, SystemTime};
 use jiff::{Timestamp, civil::Weekday, tz::TimeZone};
 use timeago::Formatter;
 
-use crate::domain::{model::Account, vo::PlatformAccountMeta};
+use crate::domain::{model::Account, vo::AccountId};
 
-pub fn display_name(account: Option<&Account>, fallback_id: i64) -> String {
-    let Some(account) = account else {
-        return format!("User{}", fallback_id);
-    };
-    let meta = account
-        .meta
-        .clone()
-        .and_then(|v| serde_json::from_value::<PlatformAccountMeta>(v).ok());
-
-    let Some(meta) = meta else {
+pub fn display_name(account: Option<&Account>, fallback_id: AccountId) -> String {
+    let Some(meta) = account.and_then(Account::platform_meta) else {
         return format!("User{}", fallback_id);
     };
 
@@ -27,7 +19,7 @@ pub fn display_name(account: Option<&Account>, fallback_id: i64) -> String {
     }
 }
 
-/// 动态时间格式化（24h 内相对时间，超过则绝对时间）
+/// Formats a timestamp: relative time within 24 hours, absolute time beyond.
 pub fn format_time_dyn(ts: impl Into<Option<Timestamp>>) -> String {
     let Some(ts) = ts.into() else {
         return "None".to_string();
@@ -46,7 +38,6 @@ pub fn format_relative_time(ts: Timestamp) -> String {
     Formatter::new().convert(duration)
 }
 
-/// HH:MM 时间部分
 pub fn format_time_only(ts: impl Into<Option<Timestamp>>) -> String {
     let Some(ts) = ts.into() else {
         return String::new();
@@ -56,7 +47,7 @@ pub fn format_time_only(ts: impl Into<Option<Timestamp>>) -> String {
         .to_string()
 }
 
-/// 智能日期标签：今天 / 昨天 / 周二 / 7月19日 / 2024年7月19日
+/// Date label: today, yesterday, weekday, month and day, or full date with the year.
 pub fn format_date_label(ts: impl Into<Option<Timestamp>>) -> String {
     let Some(ts) = ts.into() else {
         return String::new();
@@ -64,33 +55,33 @@ pub fn format_date_label(ts: impl Into<Option<Timestamp>>) -> String {
     let now = Timestamp::now();
     let secs = now.as_second() - ts.as_second();
     if secs < 0 {
-        return String::from("今天");
+        return String::from("today");
     }
     let days = secs / 86400;
 
     if days < 1 {
-        "今天".into()
+        "today".into()
     } else if days < 2 {
-        "昨天".into()
+        "yesterday".into()
     } else if days < 7 {
         let wd = ts.to_zoned(TimeZone::system()).weekday();
         match wd {
-            Weekday::Monday => "周一",
-            Weekday::Tuesday => "周二",
-            Weekday::Wednesday => "周三",
-            Weekday::Thursday => "周四",
-            Weekday::Friday => "周五",
-            Weekday::Saturday => "周六",
-            Weekday::Sunday => "周日",
+            Weekday::Monday => "Monday",
+            Weekday::Tuesday => "Tuesday",
+            Weekday::Wednesday => "Wednesday",
+            Weekday::Thursday => "Thursday",
+            Weekday::Friday => "Friday",
+            Weekday::Saturday => "Saturday",
+            Weekday::Sunday => "Sunday",
         }
         .into()
     } else {
         let z = ts.to_zoned(TimeZone::system());
         let now_z = jiff::Zoned::now();
         if z.year() == now_z.year() {
-            format!("{}月{}日", z.month(), z.day())
+            z.strftime("%b %-d").to_string()
         } else {
-            format!("{}年{}月{}日", z.year(), z.month(), z.day())
+            z.strftime("%b %-d, %Y").to_string()
         }
     }
 }

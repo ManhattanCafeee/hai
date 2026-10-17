@@ -10,11 +10,12 @@ path = "src/main.rs"
 [dependencies]
 hai-macros = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 config = { workspace = true }
 dotenvy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
+bytes = { workspace = true }
 
 genai = { workspace = true }
 rmcp = { workspace = true }
@@ -27,8 +28,12 @@ tracing-serde = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
+encoding_rs = { workspace = true }
+url = { workspace = true }
 mime = { workspace = true }
-arc-swap = { workspace = true }
+dom_smoothie = { workspace = true }
+dom_query = { workspace = true }
+roxmltree = { workspace = true }
 derive_more = { workspace = true }
 jiff = { workspace = true }
 jiff-sqlx = { workspace = true }
@@ -36,7 +41,6 @@ anyhow = { workspace = true }
 
 uuid = { workspace = true }
 strum = { workspace = true }
-struct-patch = { workspace = true }
 toml = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }

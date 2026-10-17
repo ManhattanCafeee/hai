@@ -1,42 +1,50 @@
-pub mod context;
+//! The composition root: logging, the process context, the agent runtime, channel startup and
+//! shutdown orchestration.
 
-pub use context::AppContext;
+use std::sync::Arc;
+
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    agent::runtime::AgentEngine, config::AppConfigManager, error::Result,
-    platform::manager::spawn_bots,
+    agent::runtime::{AgentRuntime, AppContext},
+    config::AppConfig,
+    error::Result,
+    platform::host::ChannelHost,
 };
 
-pub struct App {
-    pub config_mgr: AppConfigManager,
+pub async fn serve(cfg: Arc<AppConfig>) -> Result<()> {
+    let level = cfg.logging.level()?;
+    let filter = EnvFilter::new(format!("{},rmcp=warn,html5ever=error", level));
+    tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .init();
+
+    let ctx = AppContext::new(cfg).await?;
+    let runtime = AgentRuntime::new(ctx.clone()).await?;
+    let host = ChannelHost::spawn_all(&ctx, &runtime).await?;
+
+    wait_for_shutdown_signal().await;
+    tracing::info!("Shutting down...");
+    host.shutdown().await;
+    runtime.event_bus().flush().await;
+    tracing::info!("Shutdown complete");
+    Ok(())
 }
 
-impl App {
-    pub fn new(config_mgr: AppConfigManager) -> Self {
-        Self { config_mgr }
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+        }
     }
 
-    pub async fn serve(config_mgr: AppConfigManager) -> Result<()> {
-        let cfg = config_mgr.load();
-        let level = cfg.logging.level()?;
-        let filter = EnvFilter::new(format!("{},rmcp=warn", level));
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_env_filter(filter)
-            .init();
-
-        App::new(config_mgr).run().await
-    }
-
-    pub async fn run(self) -> Result<()> {
-        let ctx = AppContext::new(self.config_mgr).await?;
-        let engine = AgentEngine::new(ctx.clone()).await?;
-
-        spawn_bots(&ctx, &engine).await?;
-
-        // 主线程保持运行
+    #[cfg(not(unix))]
+    {
         tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Shutting down...");
-        Ok(())
     }
 }

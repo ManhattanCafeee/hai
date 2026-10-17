@@ -1,185 +1,159 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use genai::chat::ChatMessage;
-use uuid::Uuid;
 
 use crate::{
     agent::{
         context::{
             ContextMessages, RenderContext, build_situation_section,
-            helper::{
-                SearchRelatedParams, build_search_query, collect_accounts, load_chat,
-                load_perceptions, load_reply_map, search_related_context, search_related_dedup,
+            load::{
+                ChapterRecall, LoadedPerceptions, chapter_recall, collect_accounts, load_chat,
+                load_perceptions, load_reply_map,
             },
             render_context::RenderContextData,
-            render_main_context,
+            render_main_context, render_situation_only,
+            types::BuiltContext,
         },
-        link::BuiltContext,
-        runtime::context::TurnContext,
+        runtime::turn::TurnContext,
     },
-    domain::model::Message,
+    domain::{
+        model::{Account, Attachment, Chat, Memory, Message, Topic},
+        vo::MessageId,
+    },
     error::Result,
 };
 
-// ── Shared data ──────────────────────────────────────────────────────────────
-
 struct PromptInput {
-    /// 对话流（窗口）+ 窗口外引用上下文。
     messages: ContextMessages,
-    /// 窗口消息 id（mark_seen 用）
-    message_ids: Vec<i64>,
-    /// 消息解析（RAG 检索用）
-    parsed: Vec<crate::agent::context::types::ParsedContent>,
-    /// 附件感知（items 注入感知节 + map 供渲染器内联分析）
-    perception: crate::agent::context::types::PerceptionResult,
-    topics: Vec<crate::domain::model::Topic>,
-    accounts: Vec<crate::domain::model::Account>,
-    chat: crate::domain::model::Chat,
+    attachments: HashMap<MessageId, Vec<Attachment>>,
+    perception: LoadedPerceptions,
+    topics: Vec<Topic>,
+    pinned_memories: Vec<Memory>,
+    window_text: String,
+    accounts: Vec<Account>,
+    chat: Option<Chat>,
 }
 
-/// 装配 build_prompt 所需的全部输入：一次组织 DB 查询（消息/引用/感知/话题/账号/chat），
-/// 供 RAG 检索与上下文渲染共用。
-async fn prepare_prompt_input(ctx: &TurnContext, messages: &[Message]) -> Result<PromptInput> {
-    let services = &ctx.app.db.srv;
-    let parser = ctx.handler.content_parser();
-    let chat_id = ctx.chat_id;
+/// Loads every input `build_prompt` needs.
+async fn prepare_prompt_input(
+    ctx: &TurnContext,
+    messages: &[Message],
+    is_first: bool,
+) -> Result<PromptInput> {
+    let services = &ctx.app.services;
+    let chat_id = ctx.tool.chat.chat_id();
 
-    // 窗口消息即对话流；窗口外引用映射单独构建（不污染对话流渲染）
     let reply_map = load_reply_map(services, messages).await?;
-    let parsed: Vec<_> = messages.iter().map(|m| parser.parse(&m.content)).collect();
-    let perception = load_perceptions(services, &parsed).await?;
-    // 首轮全量注入上限：活跃话题截断（防 prompt 膨胀；配置 related_topic_limit）
-    let mut topics = services.topic.get_active_topics(chat_id).await?;
-    let inject_limit = ctx.app.cfg.agent.context.related_topic_limit as usize;
-    if topics.len() > inject_limit {
-        topics.truncate(inject_limit);
-    }
+
+    // Out-of-window reply targets come after the window, in id order: perception loading ties
+    // each subject to the first occurrence it sees, so that order has to be stable.
+    let mut ordered_ids: Vec<MessageId> = messages.iter().map(|m| m.id).collect();
+    let mut reply_ids: Vec<MessageId> = reply_map.keys().copied().collect();
+    reply_ids.sort_unstable();
+    ordered_ids.extend(reply_ids);
+
+    let attachments = services
+        .message
+        .attachments_by_messages(&ordered_ids)
+        .await?;
+    let window_attachments: Vec<Attachment> = ordered_ids
+        .iter()
+        .filter_map(|id| attachments.get(id))
+        .flatten()
+        .cloned()
+        .collect();
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|message| {
+            let own = attachments.get(&message.id).map_or(&[][..], Vec::as_slice);
+            message.content(own)
+        })
+        .collect();
+    let perception = load_perceptions(services, &window_attachments, &texts, is_first).await?;
+
+    let (topics, pinned_memories, chat) = if is_first {
+        (
+            services.topic.active_topics(chat_id).await?,
+            services
+                .memory
+                .pinned(chat_id, ctx.app.cfg.agent.context.pinned_memory_limit)
+                .await?,
+            Some(load_chat(services, chat_id).await?),
+        )
+    } else {
+        (Vec::new(), Vec::new(), None)
+    };
     let accounts = collect_accounts(services, messages, &reply_map).await?;
-    let chat = load_chat(services, chat_id).await?;
 
     Ok(PromptInput {
-        message_ids: messages.iter().map(|m| m.id).collect(),
         messages: ContextMessages::new(messages.to_vec(), reply_map),
-        parsed,
+        attachments,
         perception,
         topics,
+        pinned_memories,
+        window_text: texts.join("\n"),
         accounts,
         chat,
     })
 }
 
-// ── Builder ─────────────────────────────────────────────────────────────────
-
-/// 构建上下文 prompt。首轮全量渲染，后续轮次增量。
+/// Builds the turn's context prompt: the first turn of a chapter renders the opening blocks, later turns only the volatile sections.
 pub async fn build_prompt(
     ctx: &TurnContext,
     messages: &[Message],
-    shown_memory_ids: &HashSet<Uuid>,
-    shown_topic_ids: &HashSet<Uuid>,
     is_first: bool,
+    new_message_ids: &HashSet<MessageId>,
 ) -> Result<BuiltContext> {
-    let services = &ctx.app.db.srv;
     let cfg = &ctx.app.cfg;
-    let parser = ctx.handler.content_parser();
-    let chat_id = ctx.chat_id;
 
     if !is_first && messages.is_empty() {
+        let rendered = render_situation_only(&ctx.events.coalesce(ctx.language));
         return Ok(BuiltContext {
-            rendered_prompt: String::new(),
-            messages: vec![],
-            message_ids: vec![],
-            shown_memory_ids: Vec::new(),
-            shown_topic_ids: Vec::new(),
+            messages: vec![ChatMessage::user(&rendered)],
+            rendered_prompt: rendered,
         });
     }
 
-    let data = prepare_prompt_input(ctx, messages).await?;
+    let data = prepare_prompt_input(ctx, messages, is_first).await?;
 
-    let (search, new_shown_memory_ids, new_shown_topic_ids) = if is_first {
-        let search = search_related_context(SearchRelatedParams {
-            services,
-            cfg,
-            chat_id,
-            topics: &data.topics,
-            parsed: &data.parsed,
-            perceptions: &data.perception.items,
-            shown_memory_ids: &HashSet::new(),
-            shown_topic_ids: &HashSet::new(),
-        })
-        .await?;
-        let memory_ids: Vec<Uuid> = search.memories.iter().map(|m| m.id.0).collect();
-        let topic_ids: Vec<Uuid> = search.topics.iter().map(|t| t.topic.id).collect();
-        (Some(search), memory_ids, topic_ids)
+    let recalled = if is_first {
+        chapter_recall(
+            &ctx.app.services,
+            ctx.tool.chat.chat_id(),
+            &data.window_text,
+            &data.pinned_memories,
+            &data.topics,
+        )
+        .await?
     } else {
-        let search = search_related_dedup(SearchRelatedParams {
-            services,
-            cfg,
-            chat_id,
-            topics: &data.topics,
-            parsed: &data.parsed,
-            perceptions: &data.perception.items,
-            shown_memory_ids,
-            shown_topic_ids,
-        })
-        .await?;
-        let memory_ids: Vec<Uuid> = search.memories.iter().map(|m| m.id.0).collect();
-        let topic_ids: Vec<Uuid> = search.topics.iter().map(|t| t.topic.id).collect();
-        (Some(search), memory_ids, topic_ids)
+        ChapterRecall::default()
     };
-    let search = search.unwrap();
-
-    let related_knowledge = if is_first && cfg.knowledge.inject.enable {
-        let inject = &cfg.knowledge.inject;
-        let query = build_search_query(&data.topics, &data.parsed, &data.perception.items);
-        if query.is_empty() {
-            Vec::new()
-        } else {
-            services
-                .knowledge
-                .search(&query, inject.limit, &inject.collections)
-                .await?
-        }
-    } else {
-        Vec::new()
-    };
-
-    let total_unread = if is_first {
-        services.message.count_unread_by_chat(chat_id).await? as i64
-    } else {
-        0
-    };
-
-    // 首轮/后续轮同源：prepare 已查附件感知（load_perceptions），渲染器直接复用（不重复查询）
-    let renderer = parser.create_renderer(&data.perception.map);
 
     let context_data = RenderContextData {
-        bot: ctx.handler.profile(),
+        channel: ctx.tool.chat.profile(),
         chat: data.chat,
         current_time: jiff::Zoned::now().to_string(),
+        first_turn: is_first,
         messages: data.messages,
-        total_unread,
-        topics: if is_first { data.topics } else { vec![] },
-        related_topics: search.topics,
-        related_memories: search.memories,
-        related_knowledge,
+        new_message_ids: new_message_ids.clone(),
+        attachments_by_message: data.attachments,
+        perception_by_attachment: data.perception.by_attachment,
+        same_resource_as: data.perception.same_resource_as,
         accounts: data.accounts,
-        perceptions: if is_first {
-            data.perception.items
-        } else {
-            vec![]
-        },
+        current_topics: data.topics,
+        pinned_memories: data.pinned_memories,
+        recalled_memories: recalled.memories,
+        recalled_topics: recalled.topics,
+        perceptions: data.perception.url_items,
         topic_idle_hours: cfg.agent.context.topic_idle_hours,
     };
-    let render_ctx = RenderContext::new(context_data, renderer);
-    let instruction = build_situation_section(&ctx.events.coalesce());
+    let render_ctx = RenderContext::new(context_data);
+    let instruction = build_situation_section(&ctx.events.coalesce(ctx.language));
 
     let rendered = render_main_context(&render_ctx, instruction);
 
     Ok(BuiltContext {
         messages: vec![ChatMessage::user(&rendered)],
         rendered_prompt: rendered,
-        message_ids: data.message_ids,
-        shown_memory_ids: new_shown_memory_ids,
-        shown_topic_ids: new_shown_topic_ids,
     })
 }

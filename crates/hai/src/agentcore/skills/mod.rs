@@ -1,3 +1,3 @@
 mod manager;
 
-pub use manager::{Skill, SkillManager};
+pub use manager::{Skill, SkillManager, SkillName};

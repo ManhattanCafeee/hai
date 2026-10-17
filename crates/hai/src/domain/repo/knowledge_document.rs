@@ -2,9 +2,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    domain::model::{KnowledgeChunk, KnowledgeDocument},
-    error::Result,
-    util::pgvector,
+    domain::{
+        model::{KnowledgeChunk, KnowledgeDocument},
+        repo::vector,
+        vo::{Collection, KnowledgeDocumentId},
+    },
+    error::{AppError, Result, bail},
 };
 
 #[derive(Debug, Clone)]
@@ -17,7 +20,6 @@ impl KnowledgeDocumentRepo {
         Self { pool }
     }
 
-    /// 按 source 查文档（source 唯一，幂等导入比对依据）。
     pub async fn find_by_source(&self, source: &str) -> Result<Option<KnowledgeDocument>> {
         sqlx::query_as::<_, KnowledgeDocument>(
             "SELECT * FROM knowledge_document WHERE source = $1 LIMIT 1",
@@ -28,9 +30,8 @@ impl KnowledgeDocumentRepo {
         .map_err(Into::into)
     }
 
-    /// 文档列表（可按 collection 过滤，更新时间倒序）。
-    pub async fn list(&self, collection: Option<&str>) -> Result<Vec<KnowledgeDocument>> {
-        let rows = match collection {
+    pub async fn list(&self, collection: Option<&Collection>) -> Result<Vec<KnowledgeDocument>> {
+        let rows = match collection.map(Collection::as_str) {
             Some(col) => {
                 sqlx::query_as::<_, KnowledgeDocument>(
                     "SELECT * FROM knowledge_document WHERE collection = $1 \
@@ -51,23 +52,28 @@ impl KnowledgeDocumentRepo {
         Ok(rows)
     }
 
-    /// 白名单 collection 下的文档 id（去重排序，检索过滤用）。
-    pub async fn ids_by_collections(&self, collections: &[String]) -> Result<Vec<Uuid>> {
+    pub async fn ids_by_collections(
+        &self,
+        collections: &[Collection],
+    ) -> Result<Vec<KnowledgeDocumentId>> {
         if collections.is_empty() {
             return Ok(Vec::new());
         }
-        let mut ids: Vec<Uuid> =
+        let spellings: Vec<&str> = collections.iter().map(Collection::as_str).collect();
+        let ids: Vec<Uuid> =
             sqlx::query_scalar("SELECT id FROM knowledge_document WHERE collection = ANY($1)")
-                .bind(collections)
+                .bind(spellings)
                 .fetch_all(&self.pool)
                 .await?;
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        Ok(ids
+            .into_iter()
+            .map(KnowledgeDocumentId)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 
-    /// 按 id 批量取文档（检索溯源用）。
-    pub async fn by_ids(&self, ids: &[Uuid]) -> Result<Vec<KnowledgeDocument>> {
+    pub async fn by_ids(&self, ids: &[KnowledgeDocumentId]) -> Result<Vec<KnowledgeDocument>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -80,10 +86,11 @@ impl KnowledgeDocumentRepo {
         Ok(rows)
     }
 
-    /// 事务内整文档重建：删旧（级联删块）→ 插新文档 + 全部块（含向量）。
-    ///
-    /// 调用方负责在事务外生成 embeddings（网络 RPC 不持有连接）；此处只做 DB 写，
-    /// 任一步失败整体回滚（无孤儿行，重跑安全）。
+    /// Rebuilds a whole document in one transaction: the old rows (and their chunks) go first,
+    /// then the document and all of its chunks — vectors included — are inserted. The caller
+    /// generates the embeddings outside the transaction, since an embedding call must not hold a
+    /// connection. `embeddings` must align with `chunks`: a mismatch is an error, not a silently
+    /// truncated index.
     pub async fn upsert_document(
         &self,
         source: &str,
@@ -91,9 +98,15 @@ impl KnowledgeDocumentRepo {
         chunks: &[KnowledgeChunk],
         embeddings: &[Vec<f32>],
     ) -> Result<()> {
+        if chunks.len() != embeddings.len() {
+            bail!(AppError::message(format!(
+                "{} chunks but {} embeddings for source {source}",
+                chunks.len(),
+                embeddings.len()
+            )));
+        }
         let mut tx = self.pool.begin().await?;
 
-        // 级联删旧（块行即向量载体，随行删除）
         sqlx::query(
             "DELETE FROM knowledge_chunk \
              WHERE document_id IN (SELECT id FROM knowledge_document WHERE source = $1)",
@@ -111,7 +124,7 @@ impl KnowledgeDocumentRepo {
              (id, title, collection, source, content, meta, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
-        .bind(doc.id)
+        .bind(doc.id.0)
         .bind(&doc.title)
         .bind(&doc.collection)
         .bind(&doc.source)
@@ -123,18 +136,17 @@ impl KnowledgeDocumentRepo {
         .await?;
 
         for (chunk, emb) in chunks.iter().zip(embeddings) {
-            // 向量写入与块行同事务（行即向量载体）
             sqlx::query(
                 "INSERT INTO knowledge_chunk \
                  (id, document_id, seq, content, created_at, embedding) \
                  VALUES ($1, $2, $3, $4, $5, $6::vector)",
             )
-            .bind(chunk.id)
-            .bind(chunk.document_id)
+            .bind(chunk.id.0)
+            .bind(chunk.document_id.0)
             .bind(chunk.seq)
             .bind(&chunk.content)
             .bind(jiff_sqlx::Timestamp::from(chunk.created_at))
-            .bind(pgvector::vec_to_pgstring(emb))
+            .bind(vector::vec_to_pgstring(emb))
             .execute(&mut *tx)
             .await?;
         }
@@ -143,15 +155,14 @@ impl KnowledgeDocumentRepo {
         Ok(())
     }
 
-    /// 删除文档：级联删块（向量随行删除），事务内。
-    pub async fn delete(&self, document_id: Uuid) -> Result<()> {
+    pub async fn delete(&self, document_id: KnowledgeDocumentId) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM knowledge_chunk WHERE document_id = $1")
-            .bind(document_id)
+            .bind(document_id.0)
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM knowledge_document WHERE id = $1")
-            .bind(document_id)
+            .bind(document_id.0)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;

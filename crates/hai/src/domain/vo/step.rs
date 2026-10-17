@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::vo::ToolCallResult;
 
-/// 一次 LLM exec_chat 的完整记录。
+/// One `exec_chat` call in full.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub tool_calls: Vec<ToolCallResult>,

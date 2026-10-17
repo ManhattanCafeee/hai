@@ -1,124 +1,109 @@
-use std::fmt;
-
 use serde::Deserialize;
 use serde_json::Value;
 
-// ---------------------------------------------------------------------------
-// Lenient Vec<i64> 反序列化（accepts array, single number, or "x,y" string）
-// ---------------------------------------------------------------------------
+use crate::agentcore::tool::{ToolError, tool_err};
 
-struct LenientI64Visitor;
+pub const MAX_RESULTS: u32 = 20;
 
-impl<'de> serde::de::Visitor<'de> for LenientI64Visitor {
-    type Value = Vec<i64>;
-
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("an array of integers, a single integer, or a comma-separated string")
-    }
-
-    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(vec![v])
-    }
-
-    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(vec![v as i64])
-    }
-
-    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(vec![v as i64])
-    }
-
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        v.split(',')
-            .map(|s| s.trim().parse::<i64>().map_err(serde::de::Error::custom))
-            .collect()
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::SeqAccess<'de>,
-    {
-        let mut vec = Vec::new();
-        while let Some(elem) = seq.next_element::<i64>()? {
-            vec.push(elem);
-        }
-        Ok(vec)
-    }
+pub fn bounded_limit(limit: Option<u32>, default: u32) -> u32 {
+    limit.unwrap_or(default).clamp(1, MAX_RESULTS)
 }
 
-pub fn deserialize_lenient_i64_vec<'de, D>(d: D) -> Result<Vec<i64>, D::Error>
+pub fn required<T>(value: Option<T>, field: &str, op: &str) -> Result<T, ToolError> {
+    value.ok_or_else(|| tool_err(format!("op `{op}` requires `{field}`")))
+}
+
+/// Lenient `Option<Vec<T>>` of integers: the model may send an array, a bare number, or a `"1,2"`
+/// string. Fractions and unparsable values are rejected rather than rounded or dropped.
+pub fn deserialize_option_lenient_i64_vec<'de, D, T>(d: D) -> Result<Option<Vec<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: From<i64>,
 {
-    d.deserialize_any(LenientI64Visitor)
+    let value = Value::deserialize(d)?;
+    let raw: Option<Vec<i64>> = match value {
+        Value::Null => None,
+        Value::Array(items) => Some(items.iter().map(integer).collect::<Result<_, _>>()?),
+        Value::String(text) if text.contains(',') => Some(
+            text.split(',')
+                .map(|part| part.trim().parse::<i64>().map_err(serde::de::Error::custom))
+                .collect::<Result<_, _>>()?,
+        ),
+        scalar => Some(vec![integer(&scalar)?]),
+    };
+    Ok(raw.map(|ids| ids.into_iter().map(T::from).collect()))
 }
 
-pub fn deserialize_option_lenient_i64_vec<'de, D>(d: D) -> Result<Option<Vec<i64>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct OptVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for OptVisitor {
-        type Value = Option<Vec<i64>>;
-
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an array of integers, a single integer, a comma-separated string, or null")
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(None)
-        }
-
-        fn visit_unit<E>(self) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(None)
-        }
-
-        fn visit_some<D2>(self, d2: D2) -> Result<Self::Value, D2::Error>
-        where
-            D2: serde::de::Deserializer<'de>,
-        {
-            d2.deserialize_any(LenientI64Visitor).map(Some)
-        }
+fn integer<E: serde::de::Error>(value: &Value) -> Result<i64, E> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .ok_or_else(|| serde::de::Error::custom(format!("expected an integer, got {number}"))),
+        Value::String(text) => text.trim().parse::<i64>().map_err(serde::de::Error::custom),
+        other => Err(serde::de::Error::custom(format!(
+            "expected an integer, got {other}"
+        ))),
     }
-
-    d.deserialize_option(OptVisitor)
 }
 
-/// Lenient deserialization for `Option<u64>` — accepts number, string, or null.
 pub fn deserialize_option_lenient_u64<'de, D>(d: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let v = Value::deserialize(d)?;
-    match v {
+    let value = Value::deserialize(d)?;
+    match value {
         Value::Null => Ok(None),
-        Value::Number(n) => n
+        Value::String(text) if text.trim().is_empty() => Ok(None),
+        scalar => integer_u64(&scalar).map(Some),
+    }
+}
+
+fn integer_u64<E: serde::de::Error>(value: &Value) -> Result<u64, E> {
+    match value {
+        Value::Number(number) => number
             .as_u64()
-            .ok_or_else(|| serde::de::Error::custom("expected u64"))
-            .map(Some),
-        Value::String(s) if s.is_empty() => Ok(None),
-        Value::String(s) => s.parse::<u64>().map(Some).map_err(serde::de::Error::custom),
-        _ => Err(serde::de::Error::custom(
-            "expected a number or string representing u64",
-        )),
+            .ok_or_else(|| serde::de::Error::custom(format!("expected an integer, got {number}"))),
+        Value::String(text) => text.trim().parse::<u64>().map_err(serde::de::Error::custom),
+        other => Err(serde::de::Error::custom(format!(
+            "expected an integer, got {other}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+    use serde_json::json;
+
+    #[derive(Deserialize)]
+    struct Lenient {
+        #[serde(
+            default,
+            deserialize_with = "super::deserialize_option_lenient_i64_vec"
+        )]
+        ids: Option<Vec<i64>>,
+    }
+
+    fn ids(value: serde_json::Value) -> Option<Vec<i64>> {
+        serde_json::from_value::<Lenient>(json!({ "ids": value }))
+            .expect("lenient")
+            .ids
+    }
+
+    #[test]
+    fn lenient_i64_accepts_array_scalar_and_comma_string() {
+        assert_eq!(ids(json!([1, 2])), Some(vec![1, 2]));
+        assert_eq!(ids(json!(7)), Some(vec![7]));
+        assert_eq!(ids(json!("7")), Some(vec![7]));
+        assert_eq!(ids(json!("7, 8")), Some(vec![7, 8]));
+        assert_eq!(ids(json!(null)), None);
+    }
+
+    #[test]
+    fn lenient_i64_rejects_fractions_and_junk() {
+        assert!(serde_json::from_value::<Lenient>(json!({ "ids": 1.5 })).is_err());
+        assert!(serde_json::from_value::<Lenient>(json!({ "ids": [1.5] })).is_err());
+        assert!(serde_json::from_value::<Lenient>(json!({ "ids": "a,b" })).is_err());
+        assert!(serde_json::from_value::<Lenient>(json!({ "ids": true })).is_err());
     }
 }

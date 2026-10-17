@@ -21,14 +21,14 @@ impl IdentityService {
         let now = jiff::Timestamp::now();
         self.repos
             .identity
-            .create(uuid::Uuid::now_v7(), name, None, now, now)
+            .create(IdentityId(uuid::Uuid::now_v7()), name, None, now, now)
             .await
     }
 
     pub async fn bind_account(&self, identity_id: IdentityId, account_id: AccountId) -> Result<()> {
         self.repos
             .account
-            .bind_identity(account_id.0, identity_id.0)
+            .bind_identity(account_id, identity_id)
             .await
     }
 }

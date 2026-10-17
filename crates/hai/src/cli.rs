@@ -1,20 +1,19 @@
 pub mod display;
 pub mod kb;
 pub mod log;
+pub(crate) mod rebuild;
 pub mod tui;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
-use clap::{Parser, Subcommand, ValueEnum, builder::Styles};
+use clap::{Args, Parser, Subcommand, ValueEnum, builder::Styles};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    App,
-    config::{AppConfigManager, Paths, env::ENV_PREFIX},
+    app,
+    config::{AppConfig, Paths, env},
     domain::db,
-    rebuild,
-    util::pgvector,
 };
 
 #[derive(Parser)]
@@ -39,7 +38,7 @@ pub enum Commands {
     /// View agent event log
     Log {
         #[command(flatten)]
-        args: log::LogArgs,
+        args: LogArgs,
     },
     /// Knowledge base management
     Kb {
@@ -48,13 +47,28 @@ pub enum Commands {
     },
 }
 
+#[derive(Args)]
+pub struct LogArgs {
+    /// Show detail for a specific event seq
+    #[arg(long)]
+    pub id: Option<i64>,
+
+    /// Filter by chat id
+    #[arg(long)]
+    pub chat: Option<i64>,
+
+    /// Filter by event type (kebab-case: turn-started, tool-call, turn-ended, etc.)
+    #[arg(long)]
+    pub event: Option<String>,
+}
+
 #[derive(Subcommand)]
 pub enum KbAction {
     /// Import documents into the knowledge base (idempotent by content hash)
     Import {
         /// File or directory to import
         paths: Vec<PathBuf>,
-        /// Collection label (empty = uncategorized)
+        /// Collection label (empty = uncategorised)
         #[arg(long)]
         collection: Option<String>,
         /// Override document title (default: frontmatter title or file name)
@@ -90,7 +104,8 @@ pub enum KbAction {
 pub enum DbAction {
     /// Create the database
     Create,
-    /// Apply pending migrations
+    /// Create every table, index and constraint the schema declares, at the configured embedding
+    /// dimension
     Migrate,
     /// Rebuild vector embeddings using the current embedding model
     Rebuild {
@@ -101,7 +116,7 @@ pub enum DbAction {
 
 #[derive(Subcommand)]
 pub enum RebuildTarget {
-    /// Re-generate all vector embeddings using current model
+    /// Re-embed every row with the current embedding model
     Embeddings,
 }
 
@@ -114,52 +129,39 @@ pub enum ConfigFormat {
 
 impl Cli {
     pub async fn execute(self) -> crate::error::Result<()> {
-        let config = AppConfigManager::from_file(Paths::inferred().config_file_str())?
-            .with_env(ENV_PREFIX)?;
+        let paths = Paths::inferred();
+        env::load_dotenv(&paths.env_file())?;
+
+        let cfg = Arc::new(AppConfig::load(paths.config_file())?);
 
         if let Some(command) = self.command {
             match command {
-                Commands::Config { r#format } => {
-                    let cfg = config.load();
-                    match r#format {
-                        ConfigFormat::Json => println!("{}", serde_json::to_string_pretty(&*cfg)?),
-                        ConfigFormat::Toml => println!("{}", toml::to_string_pretty(&*cfg)?),
+                Commands::Config { r#format } => match r#format {
+                    ConfigFormat::Json => println!("{}", serde_json::to_string_pretty(&*cfg)?),
+                    ConfigFormat::Toml => println!("{}", toml::to_string_pretty(&*cfg)?),
+                },
+                Commands::Db { action } => match action {
+                    DbAction::Create => {
+                        db::create_database(&cfg.database.url).await?;
                     }
-                }
-                Commands::Db { action } => {
-                    let cfg = config.load();
-                    match action {
-                        DbAction::Create => {
-                            db::create_database(&cfg.database.url).await?;
-                        }
-                        DbAction::Migrate => {
-                            let pool = db::init_db(&cfg.database).await?;
-                            db::run_migrations(&pool).await?;
-                            let dim = cfg
-                                .auxiliary
-                                .embedding
-                                .as_ref()
-                                .map(|b| b.dimension())
-                                .unwrap_or(1024);
-                            pgvector::ensure_embedding_schema(&pool, dim).await?;
-                        }
-                        DbAction::Rebuild { target } => match target {
-                            RebuildTarget::Embeddings => {
-                                rebuild::rebuild_embeddings(&cfg).await?;
-                            }
-                        },
+                    DbAction::Migrate => {
+                        db::migrate(&cfg).await?;
                     }
-                }
+                    DbAction::Rebuild { target } => match target {
+                        RebuildTarget::Embeddings => {
+                            rebuild::rebuild_embeddings(&cfg).await?;
+                        }
+                    },
+                },
                 Commands::Log { args } => {
-                    log::execute(args).await?;
+                    log::execute(args, &cfg).await?;
                 }
                 Commands::Kb { action } => {
-                    let cfg = config.load();
                     kb::execute(action, &cfg).await?;
                 }
             }
         } else {
-            App::serve(config).await?;
+            app::serve(cfg).await?;
         }
         Ok(())
     }

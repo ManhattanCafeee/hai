@@ -1,5 +1,3 @@
-//! 知识库检索工具：agent 主动检索全局知识库。
-
 use std::sync::Arc;
 
 use schemars::JsonSchema;
@@ -8,48 +6,63 @@ use serde_json::Value;
 
 use crate::{
     agent::{
-        context::sections::knowledge::related_knowledge_section, runtime::context::ToolContext,
+        context::sections::knowledge::related_knowledge_section,
+        runtime::{AgentRuntime, turn::ToolContext},
+        tools::util::bounded_limit,
     },
     agentcore::{
         render::render_json,
-        tool::{AgentTool, MapToolErr, ToolError, tool_data},
+        tool::{AgentTool, ToolError, tool_data},
     },
-    domain::service::DbServices,
+    domain::{
+        service::Services,
+        vo::{Collection, CollectionName},
+    },
 };
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SearchKnowledgeBaseArgs {
     pub query: String,
-    pub limit: Option<i64>,
-    /// 只搜指定 collection（空 = 全部库）
-    pub collection: Option<String>,
+    pub limit: Option<u32>,
+    #[schemars(with = "Option<String>")]
+    pub collection: Option<CollectionName>,
 }
 
-/// 在全局知识库中语义检索。知识库是长期策展语料（非对话记忆），
-/// 回答需要外部知识时使用。
+/// Searches the global knowledge base by meaning and by keyword, then reorders the candidates by
+/// relevance. The knowledge base is long-term curated material (not conversation memory); use it
+/// when an answer needs outside knowledge.
 #[hai_macros::tool]
 pub struct SearchKnowledgeBase {
-    pub services: DbServices,
+    pub services: Services,
 }
 
 impl SearchKnowledgeBase {
     async fn exec(&self, args: SearchKnowledgeBaseArgs) -> Result<Value, ToolError> {
-        let limit = args.limit.unwrap_or(5).max(1);
-        let collections: Vec<String> = args.collection.map(|c| vec![c]).unwrap_or_default();
+        let limit = i64::from(bounded_limit(args.limit, 5));
+        let collections: Vec<Collection> = args
+            .collection
+            .map(|name| vec![Collection::Named(name)])
+            .unwrap_or_default();
         let hits = self
             .services
             .knowledge
             .search(&args.query, limit, &collections)
-            .await
-            .into_tool_err()?;
+            .await?;
 
         let section = related_knowledge_section(&hits);
-        tool_data(serde_json::json!({ "knowledge": render_json(section) }))
+        let count = hits.len();
+        tool_data(serde_json::json!({
+            "knowledge": render_json(&section),
+            "count": count,
+        }))
     }
 }
 
-pub fn tools(ctx: &ToolContext) -> Vec<Arc<dyn AgentTool>> {
+pub fn tools(runtime: &AgentRuntime, ctx: &ToolContext) -> Vec<Arc<dyn AgentTool>> {
+    if !runtime.cfg().knowledge.enabled {
+        return Vec::new();
+    }
     vec![Arc::new(SearchKnowledgeBase {
-        services: ctx.db.clone(),
+        services: ctx.services.clone(),
     })]
 }

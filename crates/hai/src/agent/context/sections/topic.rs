@@ -1,36 +1,33 @@
-//! 话题组件 - 构建 XML 节点
-
 use crate::{
-    agent::context::fmt::{format_relative_time, format_time_dyn},
+    agent::context::fmt::format_time_dyn,
     agentcore::render::elements::Node,
-    domain::model::Topic,
+    domain::model::{Topic, TopicNote},
 };
 
-/// `need_close` 为 true 时添加 `need-close` 属性。
 pub fn topic_element(topic: &Topic, need_close: bool) -> Node {
-    let started_at = format_relative_time(topic.started_at);
-    let last_active = format_relative_time(topic.last_active_at);
-
     let mut el = Node::tag("topic");
-
     if need_close {
         el = el.attr("need-close", true);
     }
-
-    el.attr("id", topic.id)
-        .attr("started_at", started_at)
-        .attr("last_active", last_active)
+    el.attr("id", topic.id.0)
+        .attr("status", topic.status.as_str())
+        .attr("started_at", format_time_dyn(topic.started_at))
+        .attr("last_active", format_time_dyn(topic.last_active_at))
         .attr("title", topic.title.as_deref().unwrap_or("No Title"))
         .child(Node::text(topic.summary.as_deref().unwrap_or("No Summary")))
 }
 
-/// 用于 tool 响应等无 RenderContext 的场景。
-pub fn topic_element_static(topic: &Topic) -> Node {
-    let started_at = format_time_dyn(topic.started_at);
+pub fn topic_record(topic: &Topic, notes: &[TopicNote]) -> Node {
+    let mut el = topic_element(topic, false);
+    if let (Some(first), Some(last)) = (topic.first_message_id, topic.last_message_id) {
+        el = el.attr("messages", format!("{first}-{last}"));
+    }
+    el.children(notes.iter().map(note_element).collect())
+}
 
-    Node::tag("topic")
-        .attr("id", topic.id)
-        .attr("started_at", started_at)
-        .attr("title", topic.title.as_deref().unwrap_or("No Title"))
-        .child(Node::text(topic.summary.as_deref().unwrap_or("No Summary")))
+fn note_element(note: &TopicNote) -> Node {
+    Node::tag("note")
+        .attr("id", note.id)
+        .attr("at", format_time_dyn(note.created_at))
+        .child(Node::text(&note.text))
 }

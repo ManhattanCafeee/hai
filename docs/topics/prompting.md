@@ -1,104 +1,96 @@
 # Prompt rendering
 
-> System prompt assembly, context XML rendering, personality, and skills injection. Required reading when changing `agent/context/`, `agent/node/main/`, `agent/personality/`, `agentcore/skills/`. Terminology: docs/CONTEXT.md (Memory≠knowledge base, Topic≠thread).
+> System prompt assembly, context XML rendering, personality and skills injection. Required reading when changing `agent/context/`, `agent/role/`, `agent/runtime/prompts.rs` or `agentcore/skills/`. Terms: docs/CONTEXT.md; layering: docs/architecture.md.
 
 ## Overview
 
-Produces the two inputs for each turn's LLM call in the agent: **system prompt** (assembled by `SystemPromptBuilder`, fixed within a Turn) + **context XML** (first user message, varies by turn). Both are produced by the Node engine of `agentcore/render` (`render_pretty(…, Format::Xml)`).
+A Turn's LLM call gets two prompt inputs: a **system prompt**, assembled by `agent/role/default/prompt.rs:SystemPromptBuilder` from the behavioral layers (their override chain resolved once per process) plus the chat's language (resolved once per Turn), and the **context XML** — the Turn's first user message, rebuilt each Turn by the Node engine of `agentcore/render` (`agentcore/render/mod.rs:render_xml`). Within a Turn the system prompt is byte-identical; the context XML carries what is new.
 
 ## Design
 
-### System prompt (SystemPromptBuilder)
+### System prompt assembly
 
-Key symbols: `agent/node/main/prompt.rs:SystemPromptBuilder`, `SYSTEM_PROMPT`, `SEPARATOR = "\n----------------\n"`, `Section`.
+Sections are appended in this order — `SYSTEM_PROMPT` → `# Character` → `agents` → `# Environment` → `# Private chat` / `# Group chat` → `# Language` → `skills` — and joined by a `\n----------------\n` rule, each section's content trimmed; a blank section is dropped, and a headed one renders as `{heading}\n\n{content}`. `SYSTEM_PROMPT` is the platform and tool-interface contract and is deliberately not configurable; the chat-type section is `group` or `private`, heading-less for a Channel. Every heading is English, because headings are prompt structure rather than voice.
 
-Section order (empty content dropped; when there is a heading, add `{h}\n\n{content}`; joined by SEPARATOR):
+`# Environment` is a built-in block rather than a configurable layer (`agent/runtime/prompts.rs:environment`, English-only) and it is one sentence: `[sandbox] enabled` picks between `You act through a sandbox: a container, not the machine you run on.` and `You act directly on the machine you run on.` It names the environment and stops — the model can look at the tree it got, so what a tool's own caller must know stays in that tool's description.
 
-```txt
-SYSTEM_PROMPT (hardcoded constant, no config override, no heading)
-  → # 人格 (personality_context, heading="# 人格")
-  → User system_prompt ([agent.context] system-prompt, skipped if empty, no heading)
-  → # 私聊 / # 群聊 (private_prompt / group_prompt; Channel → heading=None; skipped if empty)
-  → skills (skill_manager.discovery_prompt(), no heading)
-```
+`soul`, `agents`, `group`, `private` and the separately appended `wrap-up` resolve once at startup (`agent/runtime/prompts.rs:resolve`, one `Layer` variant per layer carrying its override file, `[prompt]` field and built-in text) from `.hai/<KEY>.md` > `[prompt] <key>` > the built-in default, blank values falling through — so an edit takes effect only after a restart; a file that exists but cannot be read fails startup rather than silently falling through (`agent/runtime/prompts.rs:override_file`). Skills share that lifecycle.
 
-`SYSTEM_PROMPT` content highlights (hard-coded; changing behavior requires touching the code):
+### Layer catalogs and the chat's language
 
-**Section responsibilities (avoid duplication — the same logic lives in exactly one place; never write behavioral guidance in tool descriptions)**:
-- Tool descriptions (`- \`xxx\`：`) — only the tool's function/effect (e.g., `skip` only says "this turn's no external speaking")
-- Behavioral guidance (interaction style / basic responsibilities) — only "when/how" (e.g., "nothing to say → tidy up first then `skip`" — the single location for guidance)
-- Domain rules (memory & topic maintenance, etc.) — domain behavior; do not repeat what the tool already expresses
+The built-in `soul` and `group` layers each exist twice: a Chinese catalog and an English one. The `private` layer ships no built-in text — a private chat renders no chat-type section, and `.hai/PRIVATE.md` or `[prompt] private` is how an operator adds one. `agentcore/language/mod.rs:Language::text_catalog` picks between them — **Chinese reads the Chinese catalog and every other language reads the English one** (`docs/CONTEXT.md` "text catalog"), so adding a language is one enum variant, its two display names and its client code. Text that exists once per catalog is held as `agentcore/language/catalog.rs:PerCatalog<T>` — every literal names both fields, so adding a catalog stops compiling at each site — and text that takes arguments is held as `PerCatalog<fn(..) -> String>`, selected by `PerCatalog::get` and then called. The boundary that holds the chat's language resolves `Language::text_catalog` once and everything below it takes `TextCatalog`: a catalog-level accessor never takes a `Language`, so a text composed of another — a wake's `describe` rendering a command's `instruction` — hands the same catalog down instead of re-deriving it. `TextCatalog` iterates, and a test pins that every catalog is one some language reads, because a catalog no language maps to is text no chat can reach. A language's name travels as the typed `agentcore/language/mod.rs:LanguageName`. A regional variant (`en-gb`, a future `zh-tw`) sits on its base language's catalog the same way, and what it changes is the statement below rather than the prose; it also has no client code of its own — `agentcore/language/mod.rs:Language::client_code` takes the tag's first segment, so a platform matching a client by code serves it its base language's (`docs/topics/platform.md`). The language itself is one aspect of a chat (`agentcore/language/mod.rs:Language`, resolved as `chat preference ?? cfg.agent.language`), chosen once per Turn and carried on `TurnContext`; the chat preference is written by `/lang` (`docs/topics/platform.md`).
 
-- **Interface (scene awareness)**: you operate in a chat app; each wake-up you receive a snapshot of the chat interface; in `<conversation>` the `<separator>新消息</separator>` divider line has old messages above and pending new messages below; `<date>`/`<msg from at>`/`<msg own>`/`<reference>` are message elements
-- **Interaction style**: the only way to interact with the world is tools — `send_message`/`send_voice`/`generate_image` send content in the input box (text/voice/image — **users can only see what these three tools emit**); `skip` — this turn's no external speaking; interaction rhythm: have it figured out → send a message; not sure → think again; the other party is still typing → wait a bit; there is information/topic change worth tidying up → tidy up (memory/topic tools) then `skip`; nothing to say and nothing to tidy up → directly `skip`
-- **Basic responsibilities** (memory/topic maintenance is a **basic behavior**, not an extra task): before responding, check memory/topics; when you hear something worth remembering, record it immediately; create new topics / update progress summaries; archive topics when they end; if you remembered wrong, update or delete. One memory records one independent fact; one topic revolves around one theme — unrelated content is established separately. Knowledge-base retrieval: when external knowledge is needed, query `search_knowledge_base` first
+The built-in `agents` and `wrap-up` layers carry one text every catalog reads instead (`agent/runtime/prompts.rs:AGENTS` and `WRAPUP`, both fields the same text): operational instructions and the retention pass are machinery, not voice — the reply's language comes from the persona and chat-type layers. The `# Environment` block is the same kind of text, and English-only for the same reason.
+
+The `# Language` section states it as identity — `你的母语是中文。` / `Your native language is Japanese.` — and stops there. A character with a native language still translates, practises a language or quotes someone when asked; writing those cases out as exceptions, or forbidding mixed language, would be spelling out judgments the model already makes.
+
+An operator override (`.hai/<LAYER>.md`, `[prompt] <key>`) is one text and serves every language: whoever writes it has decided what it says.
+
+### Where a rule lives
+
+Layer text is behavioral surface, not documentation, and the same logic lives in exactly one place: a line the layer does not need costs tokens and gives the model something to act on.
+
+- **Tool descriptions** carry only what the JSON schema cannot express — the capability, the format contract and the effect; mutual-exclusion guidance works from one location only and belongs there alone.
+- **Behavioral preferences** (tone) live in the configurable `agents` layer, never in a tool description; voice in `soul`; presence — addressee determination — in the chat-type layer; how much an answer covers, in `SYSTEM_PROMPT`.
+- Delete-test for a candidate tool-description line: without it, would the tool be used wrongly? Yes → the description; no → `agents`.
+
+**The frame over the voice.** `SYSTEM_PROMPT` and the `agents` layer set what a turn *is* — the character is the same one across turns, everything marked `own` is its own speech, and a turn is noticing what just happened rather than producing output — while `soul` only colours how it speaks. The frame decides whether the model carries itself forward or re-derives a fresh reply each turn; a persona cannot repair a frame that reads every wake as a production task.
+
+**Fit, not sufficiency, sets a turn's size.** What a message leaves unsaid was never owed, so an exchange ending on one line is finished rather than truncated; nothing the person already knows is explained back to them, and where their knowledge ends is theirs to show rather than the agent's to assume. What the agent says is its own read of the matter rather than a survey of it, and sizing an answer by what the other person needs instead makes anything the agent knows a great deal about come back as a report.
+
+**An individual, not a responder.** A message is what the agent has to say rather than an answer to a question, and a wake that carries no question — scheduled, self-scheduled through `schedule`, or a heat dispatch — is the same kind of turn as an addressed message. Wording that makes every turn look like a query turns the agent into a responder, whatever the persona says.
+
+Prompts give judgment material, not compliance clauses — no quotas, no receipts — and the mechanism never makes a decision the agent cannot see.
 
 ### Context XML rendering
 
-Key symbols: `agent/context/builder.rs:build_prompt` (single entry point), `sections/context.rs:render_main_context` / `render_context` (first turn/subsequent turns unified root = `context`), `render_context.rs:RenderContext` / `RenderContextData`.
+`agent/context/builder.rs:build_prompt` renders one `<context>` root through `agent/context/sections/context.rs:render_main_context`; children come in this order, and an empty section is dropped.
 
-Section order (first turn and subsequent turns unified `<context>` root; empty sections dropped — `Node::is_empty` = no children):
-
-```txt
-situation (WakeEvent notification: <trigger reason [count]><text/></trigger>)
-→ environment (you_are + current_time + unread count)
-→ chat (id/platform/type/created_at/name)
-→ accounts (filters out the bot itself; includes identity-related sibling accounts)
-→ related_memories (semantic search, limit = related_memory_limit, default 5)
-→ knowledge (knowledge-base RAG auto retrieval, limit = [knowledge.inject] limit, default 5; collection whitelist filter)
-→ related_topics (semantic search, only closed topics returned, excluding the current active; limit = related_topic_limit, default 3)
-→ current_topics (active/stale split by topic_idle_hours; stale adds need-close)
-→ perceptions (URL source only; attachment perception goes through in-message inline rendering)
-→ conversation (date separator / <separator>新消息</separator> before the first unread (the only new/old divider) / reply <reference>: in-window references truncated to 50 chars (content already visible as an independent message); out-of-window references looked up separately via "reference context", **not truncated** (the only presentation channel) and not re-rendered as an independent message — the conversation flow contains only in-window messages)
+```mermaid
+flowchart LR
+  context --> situation & environment & chat & accounts & current & recall & perceptions & conversation
 ```
 
-First turn vs subsequent turns differences (`is_first` passed in by dispatch from `conversation.is_first_render()` — chapter initial-state determination; see docs/topics/session.md):
+The first-turn children are the chapter's opening state, rendered once: the bot's identity, the chat and its participants, the agent's own marks (open topics, stale past `topic_idle_hours` and carrying `need-close`, plus pinned memories) and the system's recall from this Turn's window text, excluding what `current` already carries (`agent/context/load/recall.rs:chapter_recall`). The agent mutates some of that mid-chapter — the `topic` and `memory` tools close a topic or pin a memory — and those changes reach the model through the tool results it already holds, not by re-rendering the block; the opening state refreshes with the next chapter. Every Turn renders the situation; the rest of the render adds the current time.
 
-| Dimension | First turn (is_first) | Subsequent turns |
-|---|---|---|
-| root tag | `context` | `context` (unified) |
-| topics / perceptions | full injection | `vec![]` (empty) |
-| related retrieval | `search_related_context` no shown limit | `search_related_dedup` excludes shown + reduced by limit×2/3 (5→3, 3→2) |
-| total_unread | real-time count | always 0 |
-| **knowledge (RAG injection)** | retrieved when `[knowledge.inject] enable` (query same source as memory/topics) | empty (deep query goes through the `search_knowledge_base` tool) |
+`<accounts>` is ordered by account id (`agent/context/load/chat.rs:collect_accounts`): the opening state of the same chat must render the same prompt, and the order a hash map happened to produce would not.
 
-> `[knowledge.inject] enable` controls passive injection (**default false**); when enabled, injection happens only on the first turn, subsequent turns are empty.
-> First-turn determination = **chapter initial state** (`conversation.rs:Conversation::is_first_render()` = `turn_count == 0`): **new chapters from any source** (brand-new conversation / successful wrap-up — summary placed at the start / failed wrap-up opens a clean chapter) fully build the first turn — context messages fetch all unread messages (≥ seed cap 10 items; when insufficient, pull from history messages to make up the count); a restored-loaded chapter with `turn_count > 0` → not first turn (seamless continuation). See topics/session.md "First-turn determination".
+**Accumulation rule.** Rendering appends to `context_messages`, so every item must appear exactly once there; `agent/context/render_context.rs:RenderContextData`'s `first_turn` is the switch.
 
-Search assembly (`helper/search.rs`):
+**First turn means chapter initial state** — `agent/runtime/chat/conversation.rs:Conversation::is_first_render()` is `turn_count == 0`, not "a fresh agent" or "no context messages": a chapter opened by a wrap-up summary already holds that message and is still its first render, and a failed Turn never advances `turn_count` (docs/topics/chat-agent.md).
 
-- `build_search_query`: active topics title/summary + parsed text + perception content join — memory/topic/knowledge base share the same query
-- `search_related_context`: `generate_embedding` → **parallel** memory.search_related + topic.search_related_topics (`try_join!`); knowledge.search is an **independent sequential call** in builder.rs (not parallel), collection whitelist comes from `[knowledge] collections`
+**Situation-only branch.** With nothing gathered on a non-first turn, `build_prompt` returns a `<context>` whose only child is the situation section (`agent/context/sections/context.rs:render_situation_only`): a scheduled task or a command has no message of its own, so this is the only place its instruction can travel. An empty prompt would leave the model with neither instruction nor input.
 
-Helpers: `helper/chat.rs:load_chat` / `load_reply_context` / `collect_accounts` (includes identity siblings); `helper/perception.rs:PerceptionLoader` (attachment batch query + same-resource dedup, URL perception lookup).
+### Personality (soul)
 
-### personality
+The section is `You are {name}.\n{soul}` under the `# Character` heading, `config/schema.rs:PersonalityConfig.name` feeding the name. `soul` is the identity and voice body — one piece of free-form prose, no structured parsing. Prose rather than a rule list, because a prompt's shape leaks into the reply's shape: a bullet list asking for a chat register reads as two conflicting instructions.
 
-Key symbol: `agent/personality/render.rs:personality_context`.
+### The wrap-up layer
 
-```txt
-"你是 {name}。\n{description}"
-```
-
-Personality is **one-piece free-form text** (`config/schema.rs:PersonalityConfig.description`: persona foundation + behavioral etiquette + emotional aptness) — the system does no structured parsing; judgment and expression all live in the text. Struct name `PersonalityConfig` (stable trait config) and field name `description` (narrative block) each have their place — `persona` (relational mask) belongs to a future dynamic layer concept and does not occupy the current config.
+`.hai/WRAPUP.md` > `[prompt] wrap-up` > `agent/runtime/prompts.rs:WRAPUP` is its own layer, one English text appended as a user message in the wrap-up pass rather than rendered into the system prompt; the pass reuses the Default system prompt byte-identically (`agent/role/mod.rs:AgentRole::spec`), so the provider cache survives it. A structured extraction task, it stays detailed where the conversational layers stay short. The layer keeps the pass's two channels apart: the retention summary is the pass's text output (the next chapter's opening), while `memory` files the stretch's standalone facts — the summary is never one of them.
 
 ### Skills injection
 
-- `agentcore/skills/manager.rs:SkillManager::discovery_prompt()`: when non-empty, outputs a "## Skills" section (`- name: description` list), instructing the model to activate with the `load_skill` tool
-- skills with `disable_model_invocation` don't enter the discovery list (`SkillManager::discoverable_skills`)
-- `Skill::body()` replaces the `{baseDir}` placeholder with the skill directory (the instruction the model receives after `load_skill`)
+`agentcore/skills/manager.rs:SkillManager::discovery_prompt` emits a `## Skills` section when at least one skill is discoverable: one entry per skill plus the instruction to load a matching one with `read skill://<name>`. `discoverable_skills` excludes skills whose front matter sets `disable-model-invocation`, and `read`'s description mentions `skill://` only while skills exist.
 
 ## Boundaries
 
-- Section order/rendering structure is "code is the fact"; only semantics and differences are recorded here (for specific rendering, read the `sections/` files)
-- No structured parsing of personality (one-piece free-form text)
-- knowledge RAG injects only on the first turn; deep queries go through active tools
+- Node shapes and field lists are code facts; read `agent/context/sections/`.
+
+## Trade-offs and Reasons
+
+- **WrapUp reuses the Default prompt and tool surface** rather than a minimal executor: "cannot speak, cannot skip" is enforced at runtime instead of through a narrowed schema (`RoleSpec::rejects`).
+- **Chapter-opening injection rather than per-Turn retrieval**: the model gets an index of what it knows and calls `recall` itself afterwards.
 
 ## Pitfalls / common mistakes
 
-- The `<environment>` unread node is output only when the in-window unread count < total (format `"{shown} in window ({total} total unread)"`) — don't assume this node always exists (`sections/context.rs:ContextBuilder::env`)
-- Two sets of topic rendering (`sections/topic.rs:topic_element` vs `topic_element_static`): context and tool-response formats differ (`need-close`/`last_active` only exist in context), intentional but increases maintenance surface — changing one side must sync the other
-- **When subsequent-turn messages is empty, `build_prompt` early-returns** (`builder.rs:build_prompt` start `!is_first && messages.is_empty()` → empty BuiltContext) — an empty turn emits a TurnStarted with an empty full_prompt and spawns the turn as usual; be careful when changing the early-return condition or relying on rendered_prompt for display
-- First-turn determination = **chapter initial state** (`conversation.rs:Conversation::is_first_render()` = `turn_count == 0`), not "whether the session is fresh" nor "whether context messages are empty" — **a new chapter from successful wrap-up (summary at the start, context non-empty) is still first turn** (turn_count reset to zero), the first turn fully built; a restored conversation with `turn_count > 0` is not first turn (seamless continuation); a failed turn doesn't advance turn_count → first-turn eligibility is naturally preserved
-- `Node::is_empty` only recognizes children (Text nodes are always non-empty) — "empty sections dropped" relies on the no-children check; adding fixed text/attributes to a section won't trigger dropping
-- Legacy: unread semantics rely only on `interaction_status` and `<separator>` position; when changing rendering, keep the "single divider" convention. Already cleaned: first-turn topics injection cap (`related_topic_limit` truncation)
+- **Register instructions decay over a long chapter**: the prompt is fixed per Turn while the chapter grows, and nothing re-injects a style reminder mid-chapter.
+- **Two rules that cancel cost more than either is worth**: the model reconciles them itself, obeying each rule nominally while producing the wrong shape.
+- **An example is copied, not just read**: a prompt sample, a doc snippet or a test fixture quoting a real conversation ships that conversation to every deployment — examples are invented.
+- **Repetition is a frame problem, not a thin persona**: a frame that reads each wake as fresh output makes the model re-derive the same reply and restate it, and its own prior turns in the context reinforce the pattern; continuity in the frame is the lever, not another persona line.
+- **`agentcore/render/elements.rs:Node::is_empty` means no children *and* no attributes**, so an attribute-only node such as `<chat …/>` counts as content and is kept.
+- **The divider is the batch, not a stored flag**: `RenderContextData::new_message_ids` holds the message ids this Turn's accumulation changed (`agent/context/sections/message.rs:conversation_element`), and the `separator` is rendered at the first of them — keep the single-divider convention. A message renders `edited_at="…"` once the platform has edited it, and a reference whose sender chose an excerpt renders that excerpt as a `<quote>` child; neither is a message of its own.
+
+## Evolution Direction
+
+- **Per-tool text carrier**: a tool description that outgrows roughly ten lines, or that needs a table or a worked example, should move into its own prompt carrier — none exists today, because current tool syntax does not need one.

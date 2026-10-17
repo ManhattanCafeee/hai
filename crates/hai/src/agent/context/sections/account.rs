@@ -1,18 +1,10 @@
-//! 账户组件 - 构建 XML 节点
-
 use super::fmt::display_name;
-use crate::{
-    agentcore::render::elements::Node,
-    domain::{model::Account, vo::PlatformAccountMeta},
-};
+use crate::{agentcore::render::elements::Node, domain::model::Account};
 
 pub fn account_element(account: &Account) -> Node {
-    let meta = account
-        .meta
-        .as_ref()
-        .and_then(|v| serde_json::from_value::<PlatformAccountMeta>(v.clone()).ok());
+    let meta = account.platform_meta();
 
-    let mut b = Node::tag("account").attr("id", account.id);
+    let mut b = Node::tag("account").attr("id", account.id.0);
 
     if let Some(m) = &meta {
         if let Some(u) = m.username() {
@@ -24,7 +16,7 @@ pub fn account_element(account: &Account) -> Node {
     }
 
     if let Some(iid) = account.identity_id {
-        b = b.attr("identity_id", iid);
+        b = b.attr("identity_id", iid.0);
     }
 
     b

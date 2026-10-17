@@ -3,7 +3,12 @@ use std::{
     sync::Arc,
 };
 
-/// 相对路径基于进程 cwd 绝对化（容器挂载要求绝对路径）。
+use tracing::{debug, warn};
+
+use crate::error::Result;
+
+/// Make a relative path absolute against the process cwd: these roots become sandbox mounts and
+/// the container runtime needs absolute paths.
 fn absolutize(p: &Path) -> PathBuf {
     match std::env::current_dir() {
         Ok(cwd) if !p.is_absolute() => cwd.join(p),
@@ -11,17 +16,26 @@ fn absolutize(p: &Path) -> PathBuf {
     }
 }
 
-use tracing::{debug, warn};
+/// The name a skill is addressed by, as it comes in over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SkillName(String);
 
-use crate::error::Result;
+impl SkillName {
+    /// A name is never empty or blank.
+    pub fn new(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| Self(trimmed.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
-    pub allowed_tools: Option<String>,
-    pub model: Option<String>,
-    pub version: Option<String>,
     pub disable_model_invocation: bool,
     pub body: String,
     pub base_dir: PathBuf,
@@ -40,8 +54,10 @@ impl Skill {
 
 #[derive(Debug, Default, Clone)]
 pub struct SkillManager {
-    skills: Arc<Vec<Skill>>,
-    /// skill 根目录（load 时收集，去重保留）。
+    /// The loaded skills, fixed once load returns.
+    skills: Arc<[Skill]>,
+    /// Skill roots that exist on disk, collected at load and handed to the shell sandbox as
+    /// mounts.
     roots: Vec<PathBuf>,
 }
 
@@ -59,7 +75,7 @@ impl SkillManager {
             }
         }
         Ok(Self {
-            skills: Arc::new(buf),
+            skills: buf.into(),
             roots,
         })
     }
@@ -108,24 +124,16 @@ impl SkillManager {
                 continue;
             }
 
-            let metadata = parsed.frontmatter().metadata();
-            let model = metadata.and_then(|m| m.get("model")).map(String::from);
-            let version = metadata.and_then(|m| m.get("version")).map(String::from);
-            let disable_model_invocation = metadata
+            let disable_model_invocation = parsed
+                .frontmatter()
+                .metadata()
                 .and_then(|m| m.get("disable-model-invocation"))
                 .and_then(|v| v.parse::<bool>().ok())
                 .unwrap_or(false);
-            let allowed_tools = parsed
-                .frontmatter()
-                .allowed_tools()
-                .map(|at| at.as_slice().join(" "));
 
             buf.push(Skill {
                 name,
                 description: parsed.description().as_str().to_string(),
-                allowed_tools,
-                model,
-                version,
                 disable_model_invocation,
                 body: parsed.body_trimmed().to_string(),
                 base_dir: path,
@@ -142,8 +150,8 @@ impl SkillManager {
         self.skills.iter().filter(|s| !s.disable_model_invocation)
     }
 
-    pub fn find(&self, name: &str) -> Option<&Skill> {
-        self.skills.iter().find(|s| s.name == name)
+    pub fn find(&self, name: &SkillName) -> Option<&Skill> {
+        self.skills.iter().find(|s| s.name == name.as_str())
     }
 
     pub fn roots(&self) -> &[PathBuf] {
@@ -166,10 +174,9 @@ impl SkillManager {
 
         Some(format!(
             "## Skills\n\
-            你可以通过调用 `load_skill` 工具来激活以下专项能力（skills）。\
-            当用户请求与某个 skill 的描述匹配时，请调用对应的 skill：\n\
+            The specialized capabilities (skills) below expose their full instructions through `read skill://<name>`. When a user request matches the description of a skill, read its instructions first and then follow them exactly:\n\
             {}\n\
-            调用 `load_skill` 后，你会收到该 skill 的详细指令，请严格按照指令执行。",
+            A {{baseDir}} inside those instructions is the directory of that skill.",
             entries.join("\n")
         ))
     }

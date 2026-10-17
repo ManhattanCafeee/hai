@@ -1,93 +1,61 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use base64::{Engine as _, prelude::BASE64_STANDARD};
+use base64::{Engine as _, encoded_len, prelude::BASE64_STANDARD};
 use serde_json::{Value, json};
 
 use crate::{
-    agentcore::{ApiClient, Endpoint, embedding::EmbeddingService},
-    config::ProviderRegistry,
-    domain::vo::MediaCodec,
-    error::{ErrorKind, Result},
+    agentcore::{ApiClient, ModelKind, ModelTarget},
+    config::{AppConfig, ConfigIssue, model_role::ModelRoles, schema::SpeechConfig},
+    domain::vo::{AttachmentParser, ImageFormat, MediaCodec},
+    error::{AppError, Result, bail},
 };
 
-/// 图片感官转写模板。
-const IMAGE_STRUCTURE: &str = "你将看到一张图片。请把你的观察转写为文字描述——这份描述将作为唯一的视觉输入，提供给不具图像理解能力的文本模型，帮助它\"看见\"画面。按以下模板输出：\n\n\
-识别: 这是什么（结合画面线索的识别结论；软件/界面、场景、物体、文档类型；识别不清写\"不确定\"+最可能类别）\n\
-依据: 判断线索（标题栏文字/logo/布局特征等，一句）\n\
-画面概述: 一两句整体内容与氛围\n\
-布局: ASCII 字符画粗略还原画面布局（字母/符号/横线表示元素位置与大小），或文字说明方位（左/中/右、前/后、远/近）\n\
-细节:\n\
-- 主体: 画面各部分是什么、在什么位置\n\
-- 人物: 表情/动作/姿态/互动（无则省略）\n\
-- 文字: 逐字引用原文（无则省略）\n\
-- 光影/构图: 光源/色调/构图要点（无则省略）\n\
-- 其他: 值得注意的细节\n\n\
-约束: 忠实转写画面所见；细节完整，覆盖画面主要内容与重要信息——读这份描述的人看不到原图。";
+pub(crate) mod analysis;
+mod prompts;
 
-/// 视频感官转写模板。
-const VIDEO_STRUCTURE: &str = "你将看到一段视频。请把你的观察转写为文字描述——这份描述将作为唯一的视觉输入，提供给不具图像理解能力的文本模型，帮助它\"看见\"画面。按以下模板输出：\n\n\
-识别: 视频类型与内容定性（录屏/实拍/动画/演示等；识别不清写\"不确定\"+最可能类别）\n\
-依据: 判断线索（画面特征等，一句）\n\
-内容概述: 一两句主要场景与人物、整体氛围\n\
-时间线: 按时间顺序分段描述发生的事件与关键动作\n\
-细节:\n\
-- 人物: 表情/动作/互动（无则省略）\n\
-- 物体/场景: 环境特征、状态变化（无则省略）\n\
-- 镜头: 切换/运镜/景别（无则省略）\n\
-- 文字/对话: 逐字引用（无则省略）\n\
-- 其他: 值得注意的细节\n\n\
-约束: 忠实转写画面所见；时间线完整覆盖主要事件——读这份描述的人看不到原视频。";
+use self::prompts::{
+    AUDIO_JUDGMENT_PROMPT, DEFAULT_AUDIO_PROMPT, DEFAULT_IMAGE_PROMPT, DEFAULT_OCR_PROMPT,
+    DEFAULT_VIDEO_PROMPT, IMAGE_JUDGMENT_PROMPT, VIDEO_JUDGMENT_PROMPT, build_prompt,
+};
 
-/// 音频感官转写模板。
-const AUDIO_STRUCTURE: &str = "你将听到一段音频。请把你的听觉观察转写为文字描述——这份描述将作为唯一的听觉输入，提供给不具音频理解能力的文本模型，帮助它\"听见\"内容。按以下模板输出：\n\n\
-识别: 音频类型与内容定性（语音消息/会议录音/音乐/播客等；识别不清写\"不确定\"+最可能类别）\n\
-依据: 判断线索（可听特征等，一句）\n\
-内容概述: 一两句内容主题、可能的场景与整体氛围\n\
-转写: 按时间顺序逐字转写说话内容（多人对话区分说话人）\n\
-细节:\n\
-- 说话人: 识别与语气/情绪/态度（无则省略）\n\
-- 背景音: 环境信息（无则省略）\n\
-- 其他: 值得注意的细节\n\n\
-约束: 忠实转写所听内容；转写完整——读这份描述的人听不到原音频。";
-
-/// 针对性分析提示词（focus 时覆盖默认完整转写）。
-const IMAGE_JUDGMENT_PROMPT: &str =
-    "你将看到一张图片。请针对下面的分析指令直接作答，基于画面所见给出聚焦于该指令的结论：";
-const VIDEO_JUDGMENT_PROMPT: &str =
-    "你将看到一段视频。请针对下面的分析指令直接作答，基于画面所见给出聚焦于该指令的结论：";
-const AUDIO_JUDGMENT_PROMPT: &str =
-    "你将听到一段音频。请针对下面的分析指令直接作答，基于所听内容给出聚焦于该指令的结论：";
-
-/// 基础感官转写默认模板；传 focus 时由针对性分析提示词覆盖（互斥）。
-const DEFAULT_IMAGE_PROMPT: &str = IMAGE_STRUCTURE;
-const DEFAULT_VIDEO_PROMPT: &str = VIDEO_STRUCTURE;
-const DEFAULT_AUDIO_PROMPT: &str = AUDIO_STRUCTURE;
-const DEFAULT_OCR_PROMPT: &str = "请提取这张图片中的所有文字内容，按原文返回。";
-
-// ── 媒体源 ──────────────────────────────────────────────────────────────────────
-
-pub enum MediaSource {
+pub enum ImageSource {
     Url(String),
-    Bytes(Vec<u8>),
-    Base64(String),
+    Bytes { data: Vec<u8>, format: ImageFormat },
 }
 
-impl MediaSource {
+impl ImageSource {
+    pub fn bytes(data: Vec<u8>, format: ImageFormat) -> Self {
+        Self::Bytes { data, format }
+    }
+
     fn into_image_url(self) -> String {
         match self {
-            MediaSource::Url(u) => u,
-            MediaSource::Base64(b) => format!("data:image/jpeg;base64,{b}"),
-            MediaSource::Bytes(d) => {
-                format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(d))
+            Self::Url(url) => url,
+            Self::Bytes { data, format } => {
+                let mime = format.mime();
+                let mut url = String::with_capacity(
+                    "data:;base64,".len() + mime.len() + encoded_len(data.len(), true).unwrap_or(0),
+                );
+                url.push_str("data:");
+                url.push_str(mime);
+                url.push_str(";base64,");
+                BASE64_STANDARD.encode_string(data, &mut url);
+                url
             }
         }
     }
+}
 
+/// Media handed to the video or audio model; the caller supplies the codec with each call.
+pub enum MediaSource {
+    Url(String),
+    Bytes(Vec<u8>),
+}
+
+impl MediaSource {
     fn into_api_value(self, fmt: &str) -> Value {
         match self {
             MediaSource::Url(u) => json!({ "url": u }),
-            MediaSource::Base64(b) => json!({ "data": b, "format": fmt }),
             MediaSource::Bytes(d) => {
                 json!({ "data": BASE64_STANDARD.encode(d), "format": fmt })
             }
@@ -95,233 +63,95 @@ impl MediaSource {
     }
 }
 
-impl From<Vec<u8>> for MediaSource {
-    fn from(bytes: Vec<u8>) -> Self {
-        MediaSource::Bytes(bytes)
-    }
+pub enum Payload {
+    Image(ImageSource),
+    Media(MediaSource, Option<MediaCodec>),
 }
 
-// ── Modality 配置 ───────────────────────────────────────────────────────────────
-
-/// 感官输入（vision/video/audio 共用）：endpoint + 默认转写模板
+/// A model kind HAI can read, with the template its transcription falls back to.
 #[derive(Debug)]
-struct SenseCfg {
-    endpoint: Endpoint,
+struct AnalysisCfg {
+    target: ModelTarget,
     default_prompt: String,
 }
 
 #[derive(Debug)]
-struct TtsCfg {
-    endpoint: Endpoint,
+struct SpeechCfg {
+    target: ModelTarget,
     voice: String,
     speed: f32,
 }
 
-// ── 服务 ────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug)]
-pub(crate) struct MultimodalServiceInner {
+struct MultimodalServiceInner {
     client: ApiClient,
-    vision: Option<SenseCfg>,
-    video: Option<SenseCfg>,
-    audio: Option<SenseCfg>,
-    tts: Option<TtsCfg>,
-    embedding: Endpoint,
-    image_gen: Option<Endpoint>,
+    vision: Option<AnalysisCfg>,
+    video: Option<AnalysisCfg>,
+    transcription: Option<AnalysisCfg>,
+    speech: Option<SpeechCfg>,
+    image: Option<ModelTarget>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MultimodalService(Arc<MultimodalServiceInner>);
 
-#[async_trait]
-impl EmbeddingService for MultimodalService {
-    async fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
-        self.0.client.embed(&self.0.embedding, text).await
-    }
-}
-
-/// 理解类 auxiliary 块的共享访问（provider/model/enabled——块未配 = 委托主模型）
-pub(crate) trait AuxInputBlock {
-    fn provider(&self) -> Option<&str>;
-    fn model(&self) -> Option<&str>;
-    fn enabled(&self) -> bool;
-}
-
-impl AuxInputBlock for crate::config::schema::VisionConfig {
-    fn provider(&self) -> Option<&str> {
-        self.provider.as_deref()
-    }
-    fn model(&self) -> Option<&str> {
-        self.model.as_deref()
-    }
-    fn enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
-impl AuxInputBlock for crate::config::schema::AudioConfig {
-    fn provider(&self) -> Option<&str> {
-        self.provider.as_deref()
-    }
-    fn model(&self) -> Option<&str> {
-        self.model.as_deref()
-    }
-    fn enabled(&self) -> bool {
-        self.enabled
-    }
-}
-
 impl MultimodalService {
-    pub fn from_config(
-        config: &crate::config::AppConfig,
-        registry: &ProviderRegistry,
-    ) -> Result<Self> {
-        let fallback = &config.agent.provider;
-        let main_model = &config.agent.model;
-        let aux = &config.auxiliary;
-
-        let vision = Self::resolve_input(
-            registry,
-            aux.vision.as_ref(),
-            fallback,
-            main_model,
-            |b| b.image_prompt.as_deref(),
-            DEFAULT_IMAGE_PROMPT,
-        )?;
-        let video = Self::resolve_input(
-            registry,
-            aux.vision.as_ref(),
-            fallback,
-            main_model,
-            |b| b.video_prompt.as_deref(),
-            DEFAULT_VIDEO_PROMPT,
-        )?;
-        let audio = Self::resolve_input(
-            registry,
-            aux.audio.as_ref(),
-            fallback,
-            main_model,
-            |b| b.prompt.as_deref(),
-            DEFAULT_AUDIO_PROMPT,
-        )?;
-
-        // 专用类：model 必配才可用（tts/embedding/image-gen）
-        let tts = Self::resolve_tts(registry, aux.tts.as_ref(), fallback)?;
-        let embedding = Self::resolve_embedding(registry, aux.embedding.as_ref(), fallback)?;
-        let image_gen = Self::resolve_image_gen(registry, aux.image_gen.as_ref(), fallback)?;
+    /// Interprets the roles the table resolved: each one is a target, plus the `[agent.multimodal]`
+    /// switch and template around it.
+    pub(crate) fn from_config(config: &AppConfig, roles: &ModelRoles) -> Result<Self> {
+        let analysis = &config.agent.multimodal;
+        let speech_block = config.model_roles.speech.as_ref();
 
         Ok(Self(Arc::new(MultimodalServiceInner {
-            client: ApiClient::new(),
-            vision,
-            video,
-            audio,
-            tts,
-            embedding,
-            image_gen,
+            client: ApiClient::try_new()?,
+            vision: analysis_cfg(
+                roles.vision.as_ref(),
+                analysis.vision.enabled,
+                analysis.vision.image_prompt.as_deref(),
+                DEFAULT_IMAGE_PROMPT,
+            ),
+            video: analysis_cfg(
+                roles.vision.as_ref(),
+                analysis.vision.enabled,
+                analysis.vision.video_prompt.as_deref(),
+                DEFAULT_VIDEO_PROMPT,
+            ),
+            transcription: analysis_cfg(
+                roles.transcription.as_ref(),
+                analysis.transcription.enabled,
+                analysis.transcription.prompt.as_deref(),
+                DEFAULT_AUDIO_PROMPT,
+            ),
+            speech: speech_cfg(roles.speech.as_ref(), speech_block)?,
+            image: roles.image.clone(),
         })))
     }
 
-    fn resolve_input<B: AuxInputBlock>(
-        registry: &ProviderRegistry,
-        block: Option<&B>,
-        fallback_provider: &str,
-        main_model: &str,
-        prompt: impl Fn(&B) -> Option<&str>,
-        default_prompt: &str,
-    ) -> Result<Option<SenseCfg>> {
-        // 块未配：委托主模型（默认可用）
-        let Some(b) = block else {
-            return Ok(Some(SenseCfg {
-                endpoint: registry.get_endpoint(fallback_provider, main_model)?,
-                default_prompt: default_prompt.into(),
-            }));
-        };
-        if !b.enabled() {
-            return Ok(None);
-        }
-        Ok(Some(SenseCfg {
-            endpoint: registry.get_endpoint(
-                b.provider().unwrap_or(fallback_provider),
-                b.model().unwrap_or(main_model),
-            )?,
-            default_prompt: prompt(b).unwrap_or(default_prompt).into(),
-        }))
-    }
-
-    fn resolve_image_gen(
-        registry: &ProviderRegistry,
-        block: Option<&crate::config::schema::ImageGenConfig>,
-        fallback_provider: &str,
-    ) -> Result<Option<Endpoint>> {
-        // 专用类：model 必配才可用
-        let Some(b) = block else { return Ok(None) };
-        let model = b.model.as_deref().unwrap_or("");
-        if model.is_empty() {
-            return Ok(None);
-        }
-        registry
-            .get_endpoint(b.provider.as_deref().unwrap_or(fallback_provider), model)
-            .map(Some)
-    }
-
-    fn resolve_tts(
-        registry: &ProviderRegistry,
-        block: Option<&crate::config::schema::TtsConfig>,
-        fallback_provider: &str,
-    ) -> Result<Option<TtsCfg>> {
-        // 专用类：model 必配才可用
-        let Some(b) = block else { return Ok(None) };
-        let model = b.model.as_deref().unwrap_or("");
-        if model.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(TtsCfg {
-            endpoint: registry
-                .get_endpoint(b.provider.as_deref().unwrap_or(fallback_provider), model)?,
-            voice: b.voice.clone(),
-            speed: b.speed,
-        }))
-    }
-
-    fn resolve_embedding(
-        registry: &ProviderRegistry,
-        block: Option<&crate::config::schema::EmbeddingConfig>,
-        fallback_provider: &str,
-    ) -> Result<Endpoint> {
-        // 契约式失败：embedding 是必需能力——未配或 model 空 = 违约，快速失败（不静默回退）
-        let Some(b) = block else {
-            return Err(ErrorKind::Config.msg(
-                "[auxiliary.embedding] is required (memory/retrieval depends on it) but not configured",
-            ));
-        };
-        let model = b.model.as_deref().unwrap_or("");
-        if model.is_empty() {
-            return Err(ErrorKind::Config.msg(
-                "[auxiliary.embedding] is required (memory/retrieval depends on it) but model is empty",
-            ));
-        }
-        registry.get_endpoint(b.provider.as_deref().unwrap_or(fallback_provider), model)
-    }
-
-    pub async fn analyze_image(&self, source: MediaSource, focus: Option<&str>) -> Result<String> {
-        let cfg = self.0.vision.as_ref().ok_or_else(|| unavailable("图片"))?;
+    pub async fn analyze_image(&self, source: ImageSource, focus: Option<&str>) -> Result<String> {
+        let cfg = self
+            .0
+            .vision
+            .as_ref()
+            .ok_or_else(|| unavailable("image analysis"))?;
         let text = build_prompt(IMAGE_JUDGMENT_PROMPT, &cfg.default_prompt, focus);
         let body = json!([
             {"type": "text", "text": text},
             {"type": "image_url", "image_url": {"url": source.into_image_url()}},
         ]);
-        self.complete_and_extract(&cfg.endpoint, body, "vision")
-            .await
+        self.complete_and_extract(&cfg.target, body, "vision").await
     }
 
-    pub async fn ocr(&self, source: MediaSource) -> Result<String> {
-        let cfg = self.0.vision.as_ref().ok_or_else(|| unavailable("图片"))?;
+    pub async fn ocr(&self, source: ImageSource) -> Result<String> {
+        let cfg = self
+            .0
+            .vision
+            .as_ref()
+            .ok_or_else(|| unavailable("image analysis"))?;
         let body = json!([
             {"type": "text", "text": DEFAULT_OCR_PROMPT},
             {"type": "image_url", "image_url": {"url": source.into_image_url()}},
         ]);
-        self.complete_and_extract(&cfg.endpoint, body, "vision")
-            .await
+        self.complete_and_extract(&cfg.target, body, "vision").await
     }
 
     pub async fn analyze_video(
@@ -330,15 +160,18 @@ impl MultimodalService {
         format: Option<MediaCodec>,
         focus: Option<&str>,
     ) -> Result<String> {
-        let cfg = self.0.video.as_ref().ok_or_else(|| unavailable("视频"))?;
+        let cfg = self
+            .0
+            .video
+            .as_ref()
+            .ok_or_else(|| unavailable("video analysis"))?;
         let text = build_prompt(VIDEO_JUDGMENT_PROMPT, &cfg.default_prompt, focus);
         let fmt = format.as_ref().map(|c| c.api_format()).unwrap_or("mp4");
         let body = json!([
             {"type": "text", "text": text},
             {"type": "video_url", "video_url": source.into_api_value(fmt)},
         ]);
-        self.complete_and_extract(&cfg.endpoint, body, "video")
-            .await
+        self.complete_and_extract(&cfg.target, body, "video").await
     }
 
     pub async fn analyze_audio(
@@ -347,167 +180,328 @@ impl MultimodalService {
         format: Option<MediaCodec>,
         focus: Option<&str>,
     ) -> Result<String> {
-        let cfg = self.0.audio.as_ref().ok_or_else(|| unavailable("音频"))?;
+        let cfg = self
+            .0
+            .transcription
+            .as_ref()
+            .ok_or_else(|| unavailable("audio analysis"))?;
         let text = build_prompt(AUDIO_JUDGMENT_PROMPT, &cfg.default_prompt, focus);
         let fmt = format.as_ref().map(|c| c.api_format()).unwrap_or("wav");
         let body = json!([
             {"type": "text", "text": text},
             {"type": "input_audio", "input_audio": source.into_api_value(fmt)},
         ]);
-        self.complete_and_extract(&cfg.endpoint, body, "audio")
-            .await
+        self.complete_and_extract(&cfg.target, body, "audio").await
     }
 
-    pub fn image_gen_enabled(&self) -> bool {
-        self.0.image_gen.is_some()
+    /// Runs `parser` on `payload`; the two must belong to the same payload family.
+    pub async fn analyze(
+        &self,
+        parser: AttachmentParser,
+        payload: Payload,
+        focus: Option<&str>,
+    ) -> Result<String> {
+        match (parser, payload) {
+            (AttachmentParser::Image, Payload::Image(source)) => {
+                self.analyze_image(source, focus).await
+            }
+            (AttachmentParser::Ocr, Payload::Image(source)) => self.ocr(source).await,
+            (AttachmentParser::Video, Payload::Media(source, codec)) => {
+                self.analyze_video(source, codec, focus).await
+            }
+            (AttachmentParser::Audio, Payload::Media(source, codec)) => {
+                self.analyze_audio(source, codec, focus).await
+            }
+            (parser, _) => Err(AppError::message(format!(
+                "parser {parser} does not read this payload"
+            ))),
+        }
     }
 
-    pub fn tts_enabled(&self) -> bool {
-        self.0.tts.is_some()
+    pub fn vision_enabled(&self) -> bool {
+        self.0.vision.is_some()
+    }
+
+    pub fn transcription_enabled(&self) -> bool {
+        self.0.transcription.is_some()
+    }
+
+    pub fn image_enabled(&self) -> bool {
+        self.0.image.is_some()
+    }
+
+    pub fn speech_enabled(&self) -> bool {
+        self.0.speech.is_some()
     }
 
     pub async fn generate_image(
         &self,
         prompt: &str,
-        images: &[crate::agentcore::apiclient::ImageUrl],
+        images: &[crate::agentcore::api::ImageUrl],
     ) -> Result<Vec<u8>> {
         let ep = self
             .0
-            .image_gen
+            .image
             .as_ref()
-            .ok_or_else(|| unavailable("图像生成"))?;
+            .ok_or_else(|| unavailable("image generation"))?;
         self.0.client.generate_image(ep, prompt, images).await
     }
 
     pub async fn speech(&self, text: &str) -> Result<Vec<u8>> {
-        let cfg = self.0.tts.as_ref().ok_or_else(|| unavailable("语音"))?;
+        let cfg = self
+            .0
+            .speech
+            .as_ref()
+            .ok_or_else(|| unavailable("speech"))?;
         self.0
             .client
-            .speech(&cfg.endpoint, text, &cfg.voice, cfg.speed)
+            .speech(&cfg.target, text, &cfg.voice, cfg.speed)
             .await
     }
 
-    async fn complete_and_extract(&self, ep: &Endpoint, body: Value, tag: &str) -> Result<String> {
-        let resp = self.0.client.complete(ep, body).await?;
-        extract_text(&resp, tag)
+    async fn complete_and_extract(
+        &self,
+        target: &ModelTarget,
+        body: Value,
+        tag: &str,
+    ) -> Result<String> {
+        let response = self.0.client.complete(target, body).await?;
+        response
+            .text()
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::message(format!("Failed to parse {tag} response")))
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────────
+/// The analysis config of one understanding role: the target the table resolved, the switch and the
+/// template. A switched-off role mounts nothing.
+fn analysis_cfg(
+    target: Option<&ModelTarget>,
+    enabled: bool,
+    prompt: Option<&str>,
+    default_prompt: &str,
+) -> Option<AnalysisCfg> {
+    if !enabled {
+        return None;
+    }
+    target.map(|target| AnalysisCfg {
+        target: target.clone(),
+        default_prompt: prompt.unwrap_or(default_prompt).into(),
+    })
+}
+
+/// The speech config: the target the table resolved plus the block's own voice and speed.
+fn speech_cfg(
+    target: Option<&ModelTarget>,
+    block: Option<&SpeechConfig>,
+) -> Result<Option<SpeechCfg>> {
+    let (Some(target), Some(block)) = (target, block) else {
+        return Ok(None);
+    };
+    if block.voice.is_empty() {
+        bail!(ConfigIssue::model_role(
+            ModelKind::Speech,
+            "voice is required (voice names are model-scoped)"
+        ));
+    }
+    Ok(Some(SpeechCfg {
+        target: target.clone(),
+        voice: block.voice.clone(),
+        speed: block.speed,
+    }))
+}
 
 fn unavailable(name: &str) -> crate::error::AppError {
-    ErrorKind::BadRequest.msg(format!("{name}分析不可用"))
-}
-
-fn build_prompt(judgment: &str, default_prompt: &str, focus: Option<&str>) -> String {
-    match focus {
-        Some(f) => format!("{judgment}\n{f}"),
-        None => default_prompt.to_string(),
-    }
-}
-
-pub(crate) fn extract_text(resp: &Value, tag: &str) -> Result<String> {
-    resp.pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            ErrorKind::DataParse.msg(format!("Failed to parse {tag} response: {resp:?}"))
-        })
+    AppError::message(format!("{name} is unavailable"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, ProviderRegistry};
 
-    /// 块级缺省：`[auxiliary.vision]` 只配 model → enabled 默认 true、model 生效
     #[test]
-    fn vision_enabled_defaults_true() {
-        let cfg: crate::config::schema::VisionConfig =
+    fn image_bytes_carry_their_own_format_into_the_data_url() {
+        let png = ImageSource::bytes(b"\x89PNG".to_vec(), ImageFormat::Png);
+        assert_eq!(png.into_image_url(), "data:image/png;base64,iVBORw==");
+
+        let webp = ImageSource::bytes(vec![0x00, 0x01, 0x02], ImageFormat::Webp);
+        assert_eq!(webp.into_image_url(), "data:image/webp;base64,AAEC");
+
+        let url = ImageSource::Url("https://example.com/a.webp".to_owned());
+        assert_eq!(url.into_image_url(), "https://example.com/a.webp");
+    }
+
+    /// The analysis switch and the model block are separate: a `[model-roles.vision]` block carries only
+    /// the model, and `[agent.multimodal.vision]` is enabled unless turned off.
+    #[test]
+    fn the_vision_analysis_defaults_on() {
+        let vision: crate::config::schema::VisionConfig =
             toml::from_str("model = \"gpt-4o\"").unwrap();
-        assert!(cfg.enabled);
-        assert_eq!(cfg.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(vision.model.as_deref(), Some("gpt-4o"));
+
+        let analysis = crate::config::schema::VisionAnalysisConfig::default();
+        assert!(analysis.enabled);
+        assert!(analysis.image_prompt.is_none());
     }
 
-    /// auxiliary.image-gen 配置后 from_config 能解析出 image_gen 角色
-    #[test]
-    fn image_gen_from_config() {
+    /// The roles these tests exercise are about resolution, not availability, so every provider is
+    /// given a credential and every endpoint answers.
+    fn registry(cfg: &AppConfig) -> ProviderRegistry {
+        ProviderRegistry::from_sources(cfg, &|_| Some("test-key".to_owned()), &|_| true)
+    }
+
+    /// The service one config builds: the roles resolved, then interpreted.
+    fn service(cfg: &AppConfig) -> Result<MultimodalService> {
+        let roles = crate::config::model_role::resolve(cfg, &registry(cfg))?;
+        MultimodalService::from_config(cfg, &roles)
+    }
+
+    /// The config every case starts from: one chat model with its provider registered, plus the
+    /// embedding role the service insists on.
+    fn config(provider: &str, model: &str) -> AppConfig {
         let mut cfg = AppConfig::default();
-        cfg.agent.provider = "openai".into();
-        cfg.agent.model = "gpt-4o".into();
-        cfg.providers.insert("openai".into(), Default::default());
-        // embedding 是必需能力（契约式失败）——测试须配置
-        cfg.auxiliary.embedding = Some(crate::config::schema::EmbeddingConfig {
+        cfg.model_roles.default.provider = provider.into();
+        cfg.model_roles.default.model = model.into();
+        cfg.providers.insert(provider.into(), Default::default());
+        cfg.model_roles.embedding = crate::config::schema::EmbeddingConfig {
             provider: Some("openai".into()),
             model: Some("text-embedding-3-small".into()),
             dimension: None,
-        });
-        cfg.auxiliary.image_gen = Some(crate::config::schema::ImageGenConfig {
-            provider: Some("openai".into()),
-            model: Some("dall-e-3".into()),
-        });
-        let registry = crate::config::provider_manager::ProviderRegistry::new(&cfg).unwrap();
-        let svc = MultimodalService::from_config(&cfg, &registry).unwrap();
-        assert!(svc.image_gen_enabled());
+            base_url: None,
+        };
+        cfg.providers.insert("openai".into(), Default::default());
+        cfg
     }
 
-    /// 条件挂载规则：auxiliary.image-gen 未配 → disabled
-    #[test]
-    fn image_gen_disabled_when_unconfigured() {
-        let mut cfg = AppConfig::default();
-        cfg.agent.provider = "openai".into();
-        cfg.agent.model = "gpt-4o".into();
-        cfg.providers.insert("openai".into(), Default::default());
-        cfg.auxiliary.embedding = Some(crate::config::schema::EmbeddingConfig {
-            provider: Some("openai".into()),
-            model: Some("text-embedding-3-small".into()),
-            dimension: None,
-        });
-        // 不配 image_gen
-        let registry = crate::config::provider_manager::ProviderRegistry::new(&cfg).unwrap();
-        let svc = MultimodalService::from_config(&cfg, &registry).unwrap();
-        assert!(!svc.image_gen_enabled());
+    /// An absent understanding block leaves the capability off when the main provider cannot read
+    /// that media, instead of failing startup over a block nobody configured.
+    #[tokio::test]
+    async fn an_absent_block_on_a_provider_that_cannot_read_the_media_stays_off() {
+        let cfg = config("anthropic", "claude-sonnet-4-5");
+
+        let svc = service(&cfg).unwrap();
+        assert!(
+            svc.analyze_image(ImageSource::Url("https://example.com/a.png".into()), None)
+                .await
+                .is_err()
+        );
     }
 
-    /// 条件挂载规则：auxiliary.image-gen 配了但 model 空 → disabled
+    /// An absent understanding block runs on the main model and inherits its endpoint, so a proxied
+    /// `[model-roles.default]` does not send the delegated call to the provider's own root.
     #[test]
-    fn image_gen_disabled_when_model_empty() {
-        let mut cfg = AppConfig::default();
-        cfg.agent.provider = "openai".into();
-        cfg.agent.model = "gpt-4o".into();
-        cfg.providers.insert("openai".into(), Default::default());
-        cfg.auxiliary.embedding = Some(crate::config::schema::EmbeddingConfig {
-            provider: Some("openai".into()),
-            model: Some("text-embedding-3-small".into()),
-            dimension: None,
+    fn an_absent_understanding_block_inherits_the_default_endpoint() {
+        let mut cfg = config("openai", "gpt-4o");
+        cfg.model_roles.default.base_url = Some("https://gateway.internal/v1".into());
+
+        let svc = service(&cfg).unwrap();
+        assert!(svc.vision_enabled());
+        assert!(svc.transcription_enabled());
+
+        let vision = svc.0.vision.as_ref().unwrap();
+        assert_eq!(vision.target.base_url, "https://gateway.internal/v1");
+        assert_eq!(vision.target.model, "gpt-4o");
+    }
+
+    /// A block that declares a vision model on a provider which cannot read images fails startup.
+    #[test]
+    fn a_declared_understanding_block_is_checked() {
+        let mut cfg = config("openai", "gpt-4o");
+        cfg.model_roles.vision = Some(crate::config::schema::VisionConfig {
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-4-5".into()),
+            base_url: None,
         });
-        cfg.auxiliary.image_gen = Some(crate::config::schema::ImageGenConfig {
+        cfg.providers.insert("anthropic".into(), Default::default());
+
+        let err = service(&cfg).unwrap_err();
+        assert!(err.to_string().contains("serves no vision API"), "{err}");
+    }
+
+    /// A configured `[model-roles.image]` resolves to an image role in `from_config`.
+    #[test]
+    fn image_from_config() {
+        let mut cfg = config("openai", "gpt-4o");
+        cfg.model_roles.image = Some(crate::config::schema::ImageConfig {
+            provider: Some("openrouter".into()),
+            model: Some("google/gemini-2.5-flash-image".into()),
+            base_url: None,
+        });
+        cfg.providers
+            .insert("openrouter".into(), Default::default());
+        let svc = service(&cfg).unwrap();
+        assert!(svc.image_enabled());
+    }
+
+    /// Conditional mounting: an absent `[model-roles.image]` leaves image generation disabled.
+    #[test]
+    fn image_disabled_when_unconfigured() {
+        let cfg = config("openai", "gpt-4o");
+        let svc = service(&cfg).unwrap();
+        assert!(!svc.image_enabled());
+    }
+
+    /// Conditional mounting: a configured `[model-roles.image]` with an empty model stays disabled.
+    #[test]
+    fn image_disabled_when_model_empty() {
+        let mut cfg = config("openai", "gpt-4o");
+        cfg.model_roles.image = Some(crate::config::schema::ImageConfig {
             provider: Some("openai".into()),
             model: None,
+            base_url: None,
         });
-        let registry = crate::config::provider_manager::ProviderRegistry::new(&cfg).unwrap();
-        let svc = MultimodalService::from_config(&cfg, &registry).unwrap();
-        assert!(!svc.image_gen_enabled());
+        let svc = service(&cfg).unwrap();
+        assert!(!svc.image_enabled());
     }
 
-    /// provider 缺省回退 agent.provider（image_gen 只配 model）
+    /// An omitted provider falls back to `model_roles.default.provider` when image generation configures
+    /// only a model.
     #[test]
-    fn image_gen_provider_falls_back_to_agent() {
-        let mut cfg = AppConfig::default();
-        cfg.agent.provider = "openai".into();
-        cfg.agent.model = "gpt-4o".into();
-        cfg.providers.insert("openai".into(), Default::default());
-        cfg.auxiliary.embedding = Some(crate::config::schema::EmbeddingConfig {
-            provider: Some("openai".into()),
-            model: Some("text-embedding-3-small".into()),
-            dimension: None,
+    fn image_provider_falls_back_to_agent() {
+        let mut cfg = config("openrouter", "gpt-4o");
+        cfg.model_roles.image = Some(crate::config::schema::ImageConfig {
+            provider: None, // omitted → model_roles.default.provider
+            model: Some("google/gemini-2.5-flash-image".into()),
+            base_url: None,
         });
-        cfg.auxiliary.image_gen = Some(crate::config::schema::ImageGenConfig {
-            provider: None, // 缺省 → agent.provider
-            model: Some("dall-e-3".into()),
+        let svc = service(&cfg).unwrap();
+        assert!(svc.image_enabled());
+    }
+
+    fn speech_config(voice: &str, model: Option<&str>) -> AppConfig {
+        let mut cfg = config("openai", "gpt-4o");
+        cfg.model_roles.speech = Some(crate::config::schema::SpeechConfig {
+            provider: None,
+            model: model.map(str::to_owned),
+            voice: voice.into(),
+            speed: 1.0,
+            base_url: None,
         });
-        let registry = crate::config::provider_manager::ProviderRegistry::new(&cfg).unwrap();
-        let svc = MultimodalService::from_config(&cfg, &registry).unwrap();
-        assert!(svc.image_gen_enabled());
+        cfg
+    }
+
+    /// A `[model-roles.speech]` block with model and voice makes `send_message`'s voice kind available.
+    #[test]
+    fn speech_enabled_when_configured() {
+        let cfg = speech_config("alloy", Some("gpt-4o-mini-tts"));
+        let svc = service(&cfg).unwrap();
+        assert!(svc.speech_enabled());
+    }
+
+    /// Conditional mounting: a configured `[model-roles.speech]` with an empty model stays disabled.
+    #[test]
+    fn speech_disabled_when_model_empty() {
+        let cfg = speech_config("alloy", None);
+        let svc = service(&cfg).unwrap();
+        assert!(!svc.speech_enabled());
+    }
+
+    /// A voice name has no generic default: a configured model with an empty voice is a contract failure,
+    /// not a runtime provider 400.
+    #[test]
+    fn speech_voice_missing_is_config_error() {
+        let cfg = speech_config("", Some("gpt-4o-mini-tts"));
+        assert!(service(&cfg).is_err());
     }
 }

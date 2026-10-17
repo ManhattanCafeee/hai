@@ -1,19 +1,17 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use uuid::Uuid;
-
+use super::hydrate;
 use crate::{
-    agentcore::embedding::EmbeddingService,
+    agentcore::api::embedding::EmbeddingService,
     domain::{
-        model::Topic,
+        model::{Topic, TopicNote, embed_text},
         repo::Repos,
-        vo::{ChatId, MessageId, TopicId, TopicSearchResult},
+        vo::{ChatId, MessageId, TimeRange, TopicId},
     },
-    error::{ErrorKind, Result},
-    util::pgvector,
+    error::{AppError, Result},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TopicService {
     repos: Repos,
     embedding: Arc<dyn EmbeddingService>,
@@ -24,199 +22,170 @@ impl TopicService {
         Self { repos, embedding }
     }
 
-    pub async fn create_topic(
+    pub async fn open(
         &self,
         chat_id: ChatId,
         title: &str,
         summary: &str,
         message_ids: &[MessageId],
-        meta: Option<serde_json::Value>,
     ) -> Result<Topic> {
-        self.repos
-            .topic
-            .create_with_messages(
-                chat_id.0,
-                title,
-                summary,
-                None,
-                &MessageId::raw_ids(message_ids),
-                meta,
-            )
-            .await
-    }
-
-    pub async fn assign_topic(&self, message_ids: &[MessageId], topic_id: TopicId) -> Result<()> {
-        let topic = self.get_topic_or_err(topic_id.0).await?;
-        topic.ensure_not_closed()?;
-        self.repos
-            .topic
-            .assign_messages(&MessageId::raw_ids(message_ids), topic_id.0)
-            .await
-    }
-
-    pub async fn append_summary(&self, topic_id: TopicId, new_summary: &str) -> Result<Topic> {
-        let topic = self.get_topic_or_err(topic_id.0).await?;
-        topic.ensure_not_closed()?;
-
-        let formatted = format!("\n---\n{new_summary}");
-        let combined = match &topic.summary {
-            Some(s) => format!("{s}{formatted}"),
-            None => formatted,
-        };
-        self.repos
-            .topic
-            .update_fields(topic_id.0, None, Some(&combined))
+        let embedding = self
+            .embedding
+            .generate_embedding(&embed_text(title, summary))
             .await?;
-        Ok(topic)
+        self.repos
+            .topic
+            .open(chat_id, title, summary, &embedding, message_ids)
+            .await
     }
 
-    pub async fn update_topic(
+    pub async fn note(
         &self,
+        chat_id: ChatId,
+        topic_id: TopicId,
+        text: &str,
+        message_ids: &[MessageId],
+    ) -> Result<TopicNote> {
+        self.repos
+            .topic
+            .add_note(chat_id, topic_id, text, message_ids)
+            .await?
+            .ok_or_else(|| missing(topic_id))
+    }
+
+    /// A closed topic is still writable; the retrieval embedding is recomputed.
+    pub async fn revise(
+        &self,
+        chat_id: ChatId,
         topic_id: TopicId,
         title: Option<&str>,
         summary: Option<&str>,
     ) -> Result<Topic> {
-        let topic = self.get_topic_or_err(topic_id.0).await?;
+        // The embedding describes what the row will say, so the half that is not being changed comes
+        // from the row; the write itself takes the same halves and coalesces.
+        let current = self.get(chat_id, topic_id).await?;
+        let effective_title = title.or(current.title.as_deref()).unwrap_or_default();
+        let effective_summary = summary.or(current.summary.as_deref()).unwrap_or_default();
+        let embedding = self
+            .embedding
+            .generate_embedding(&embed_text(effective_title, effective_summary))
+            .await?;
         self.repos
             .topic
-            .update_fields(topic_id.0, title, summary)
-            .await?;
-        Ok(topic)
+            .update_fields(chat_id, topic_id, title, summary, &embedding)
+            .await?
+            .ok_or_else(|| missing(topic_id))
     }
 
-    pub async fn close_topic(&self, topic_id: TopicId, summary: &str) -> Result<Topic> {
-        let topic = self.get_topic_or_err(topic_id.0).await?;
-        topic.ensure_not_closed()?;
+    pub async fn close(&self, chat_id: ChatId, topic_id: TopicId) -> Result<Topic> {
+        self.repos
+            .topic
+            .close(chat_id, topic_id)
+            .await?
+            .ok_or_else(|| missing(topic_id))
+    }
 
-        self.repos.topic.close(topic_id.0, summary).await?;
-
-        if let Err(e) = pgvector::store_embedding(
-            &*self.embedding,
-            self.repos.pool(),
-            "topic",
-            topic_id.0,
-            summary,
-        )
-        .await
+    pub async fn link(
+        &self,
+        chat_id: ChatId,
+        topic_id: TopicId,
+        message_ids: &[MessageId],
+    ) -> Result<Topic> {
+        if !self
+            .repos
+            .topic
+            .link_messages(chat_id, topic_id, message_ids)
+            .await?
         {
-            tracing::warn!(topic_id = %topic_id, "close_topic embedding failed: {e}");
+            return Err(missing(topic_id));
         }
-
-        Ok(topic)
+        // The link refreshed the row's time range, so the caller reads what it just wrote.
+        self.get(chat_id, topic_id).await
     }
 
-    pub async fn search_related_topics(
+    pub async fn drop(&self, chat_id: ChatId, topic_id: TopicId) -> Result<()> {
+        if self.repos.topic.delete(chat_id, topic_id).await? {
+            Ok(())
+        } else {
+            Err(missing(topic_id))
+        }
+    }
+
+    pub async fn get(&self, chat_id: ChatId, topic_id: TopicId) -> Result<Topic> {
+        self.repos
+            .topic
+            .by_id(chat_id, topic_id)
+            .await?
+            .ok_or_else(|| missing(topic_id))
+    }
+
+    pub async fn notes(
+        &self,
+        topic_id: TopicId,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<TopicNote>, i64)> {
+        let notes = self.repos.topic.notes(topic_id, offset, limit).await?;
+        let total = self.repos.topic.notes_count(topic_id).await?;
+        Ok((notes, total))
+    }
+
+    pub async fn notes_count(&self, topic_id: TopicId) -> Result<i64> {
+        self.repos.topic.notes_count(topic_id).await
+    }
+
+    pub async fn active_topics(&self, chat_id: ChatId) -> Result<Vec<Topic>> {
+        self.repos.topic.active_by_chat(chat_id).await
+    }
+
+    pub async fn list_by_time(
+        &self,
+        chat_id: ChatId,
+        range: TimeRange,
+        limit: i64,
+    ) -> Result<Vec<Topic>> {
+        self.repos.topic.by_chat_time(chat_id, range, limit).await
+    }
+
+    pub async fn search_keywords(
+        &self,
+        chat_id: ChatId,
+        keywords: &[String],
+        range: TimeRange,
+        limit: i64,
+    ) -> Result<Vec<Topic>> {
+        self.repos
+            .topic
+            .search_by_keywords(chat_id, keywords, range, limit)
+            .await
+    }
+
+    pub async fn search_related(
         &self,
         chat_id: ChatId,
         query: &[f32],
         limit: i64,
-    ) -> Result<Vec<TopicSearchResult>> {
-        let rows = pgvector::search_embedding_vec(
-            self.repos.pool(),
-            "topic",
-            query,
-            Some(chat_id.0),
-            Some("status = 'closed'"),
-            limit,
-        )
-        .await?;
-        self.rows_to_results(rows).await
-    }
-
-    /// 向量检索行 → 结果（补 topic 实体并带距离）。
-    async fn rows_to_results(&self, rows: Vec<(Uuid, f64)>) -> Result<Vec<TopicSearchResult>> {
+    ) -> Result<Vec<Topic>> {
+        let rows = self
+            .repos
+            .topic
+            .search_by_embedding(chat_id, query, limit)
+            .await?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let ids: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
-        let topics: Vec<Topic> = self.repos.topic.by_ids(&ids).await?;
-        let map: HashMap<Uuid, Topic> = topics.into_iter().map(|t| (t.id, t)).collect();
-        Ok(rows
-            .into_iter()
-            .filter_map(|(id, dist)| {
-                map.get(&id).map(|t| TopicSearchResult {
-                    topic: t.clone(),
-                    distance: dist,
-                })
-            })
-            .collect())
+        let ids: Vec<TopicId> = rows.iter().map(|(id, _)| *id).collect();
+        let by_id = self.repos.topic.by_ids(&ids).await?;
+        Ok(hydrate::merge_hydrated(
+            rows,
+            by_id.into_iter().map(|topic| (topic.id, topic)).collect(),
+        )
+        .into_iter()
+        .map(|(topic, _)| topic)
+        .collect())
     }
+}
 
-    pub async fn get_active_topics(&self, chat_id: ChatId) -> Result<Vec<Topic>> {
-        self.repos.topic.active_by_chat(chat_id.0).await
-    }
-
-    pub async fn search_topics_by_query(
-        &self,
-        chat_id: ChatId,
-        query: &str,
-        limit: i64,
-    ) -> Result<Vec<TopicSearchResult>> {
-        let embedding = self.embedding.generate_embedding(query).await?;
-        self.search_related_topics(chat_id, &embedding, limit).await
-    }
-
-    /// 检索话题：query 有 → 语义检索（+时间过滤）；无 → 按时间范围列出。
-    pub async fn search_topics(
-        &self,
-        chat_id: ChatId,
-        query: Option<&str>,
-        since: Option<jiff::Timestamp>,
-        until: Option<jiff::Timestamp>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<TopicSearchResult>> {
-        let limit = limit.max(1) as usize;
-        if let Some(q) = query {
-            // 时间条件下推到 SQL（`search_embedding_vec_time`）：避免先取 top-N 再
-            // 内存过滤导致窗内命中被截断。
-            let embedding = self.embedding.generate_embedding(q).await?;
-            let range = match (since, until) {
-                (Some(s), Some(u)) => Some((s, u)),
-                (Some(s), None) => Some((s, jiff::Timestamp::now())),
-                (None, Some(u)) => Some((jiff::Timestamp::UNIX_EPOCH, u)),
-                (None, None) => None,
-            };
-            let rows = pgvector::search_embedding_vec_time(
-                self.repos.pool(),
-                "topic",
-                &embedding,
-                chat_id.0,
-                range,
-                limit as i64,
-                offset,
-            )
-            .await?;
-            return self.rows_to_results(rows).await;
-        }
-        let topics = self
-            .repos
-            .topic
-            .by_chat_time(chat_id.0, since, until, limit as i64, offset)
-            .await?;
-        Ok(topics
-            .into_iter()
-            .map(|t| TopicSearchResult {
-                topic: t,
-                distance: 0.0,
-            })
-            .collect())
-    }
-
-    pub async fn delete_topic(&self, topic_id: TopicId) -> Result<()> {
-        self.repos.topic.delete_by_id(topic_id.0).await?;
-        if let Err(e) = pgvector::clear_embedding_vec(self.repos.pool(), "topic", topic_id.0).await
-        {
-            tracing::warn!(topic_id = %topic_id, "Failed to clear topic embedding: {e}");
-        }
-        Ok(())
-    }
-
-    async fn get_topic_or_err(&self, id: Uuid) -> Result<Topic> {
-        self.repos
-            .topic
-            .by_id(id)
-            .await?
-            .ok_or_else(|| ErrorKind::NotFound.msg(format!("Topic not found: {id}")))
-    }
+fn missing(topic_id: TopicId) -> AppError {
+    AppError::message(format!("Topic not found: {topic_id}"))
 }

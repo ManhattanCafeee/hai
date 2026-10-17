@@ -1,7 +1,14 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{domain::model::ScheduledTask, error::Result};
+use crate::{
+    domain::{
+        model::ScheduledTask,
+        repo::ConversationRecordRepo,
+        vo::{ChannelKey, ChatEntry, ChatId, RepeatInterval, ScheduledTaskId},
+    },
+    error::Result,
+};
 
 #[derive(Debug, Clone)]
 pub struct ScheduledTaskRepo {
@@ -15,20 +22,20 @@ impl ScheduledTaskRepo {
 
     pub async fn create(
         &self,
-        bot_id: &str,
-        chat_id: i64,
+        bot_id: &ChannelKey,
+        chat_id: ChatId,
         description: &str,
         fire_at: jiff::Timestamp,
-        every_secs: Option<i64>,
+        every_secs: Option<RepeatInterval>,
     ) -> Result<ScheduledTask> {
-        let id = Uuid::now_v7();
+        let id = ScheduledTaskId::from(Uuid::now_v7());
         sqlx::query_as::<_, ScheduledTask>(
             "INSERT INTO scheduled_task (id, bot_id, chat_id, description, fire_at, every_secs) \
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
         )
         .bind(id)
         .bind(bot_id)
-        .bind(chat_id)
+        .bind(chat_id.0)
         .bind(description)
         .bind(jiff_sqlx::Timestamp::from(fire_at))
         .bind(every_secs)
@@ -39,49 +46,60 @@ impl ScheduledTaskRepo {
 
     pub async fn list_active_by_chat(
         &self,
-        bot_id: &str,
-        chat_id: i64,
+        bot_id: &ChannelKey,
+        chat_id: ChatId,
     ) -> Result<Vec<ScheduledTask>> {
-        sqlx::query_as::<_, ScheduledTask>(
-            "SELECT * FROM scheduled_task \
-             WHERE bot_id = $1 AND chat_id = $2 AND is_active \
-             ORDER BY fire_at",
-        )
-        .bind(bot_id)
-        .bind(chat_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
+        self.list_by_chat(bot_id, chat_id, TaskListing::ActiveOnly)
+            .await
     }
 
-    pub async fn list_all_by_chat(&self, bot_id: &str, chat_id: i64) -> Result<Vec<ScheduledTask>> {
-        sqlx::query_as::<_, ScheduledTask>(
-            "SELECT * FROM scheduled_task \
-             WHERE bot_id = $1 AND chat_id = $2 \
-             ORDER BY fire_at",
-        )
-        .bind(bot_id)
-        .bind(chat_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
+    pub async fn list_all_by_chat(
+        &self,
+        bot_id: &ChannelKey,
+        chat_id: ChatId,
+    ) -> Result<Vec<ScheduledTask>> {
+        self.list_by_chat(bot_id, chat_id, TaskListing::EveryTask)
+            .await
     }
 
-    pub async fn deactivate(&self, bot_id: &str, chat_id: i64, id: Uuid) -> Result<()> {
-        sqlx::query(
+    /// The one statement both chat listings run, differing only in whether dead tasks show.
+    async fn list_by_chat(
+        &self,
+        bot_id: &ChannelKey,
+        chat_id: ChatId,
+        listing: TaskListing,
+    ) -> Result<Vec<ScheduledTask>> {
+        sqlx::query_as::<_, ScheduledTask>(sqlx::AssertSqlSafe(list_sql(listing).as_str()))
+            .bind(bot_id)
+            .bind(chat_id.0)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn deactivate(
+        &self,
+        bot_id: &ChannelKey,
+        chat_id: ChatId,
+        id: ScheduledTaskId,
+    ) -> Result<u64> {
+        let result = sqlx::query(
             "UPDATE scheduled_task SET is_active = FALSE, updated_at = now() \
              WHERE id = $1 AND bot_id = $2 AND chat_id = $3",
         )
         .bind(id)
         .bind(bot_id)
-        .bind(chat_id)
+        .bind(chat_id.0)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 
-    /// 到期任务：某 bot 下 fire_at <= now 的激活任务。
-    pub async fn due(&self, bot_id: &str, now: jiff::Timestamp) -> Result<Vec<ScheduledTask>> {
+    pub async fn due(
+        &self,
+        bot_id: &ChannelKey,
+        now: jiff::Timestamp,
+    ) -> Result<Vec<ScheduledTask>> {
         sqlx::query_as::<_, ScheduledTask>(
             "SELECT * FROM scheduled_task \
              WHERE bot_id = $1 AND is_active AND fire_at <= $2 \
@@ -94,22 +112,74 @@ impl ScheduledTaskRepo {
         .map_err(Into::into)
     }
 
-    /// 推进周期任务 fire_at 到将来首个触发点；一次性任务 deactivate。
-    pub async fn advance_fire_at(
+    /// Appends the change and advances the clock in one transaction: a task that fired must not be
+    /// due again because the second write did not land.
+    pub async fn fire(
         &self,
-        id: Uuid,
-        next_fire: Option<jiff::Timestamp>,
+        task: &ScheduledTask,
+        entry: &ChatEntry,
+        now: jiff::Timestamp,
     ) -> Result<()> {
-        let sql = if next_fire.is_some() {
-            "UPDATE scheduled_task SET fire_at = $2, updated_at = now() WHERE id = $1"
-        } else {
-            "UPDATE scheduled_task SET is_active = FALSE, updated_at = now() WHERE id = $1"
-        };
-        let mut q = sqlx::query(sql).bind(id);
-        if let Some(next) = next_fire {
-            q = q.bind(jiff_sqlx::Timestamp::from(next));
+        let mut tx = self.pool.begin().await?;
+        ConversationRecordRepo::append_entry_in_tx(&mut tx, task.chat_id, entry).await?;
+        match task.next_fire_after(now) {
+            Some(next) => {
+                sqlx::query(
+                    "UPDATE scheduled_task SET fire_at = $2, updated_at = now() WHERE id = $1",
+                )
+                .bind(task.id)
+                .bind(jiff_sqlx::Timestamp::from(next))
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE scheduled_task SET is_active = FALSE, updated_at = now() WHERE id = $1",
+                )
+                .bind(task.id)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
-        q.execute(&self.pool).await?;
+        tx.commit().await?;
         Ok(())
+    }
+}
+
+/// Whether a chat listing shows dead tasks too.
+enum TaskListing {
+    ActiveOnly,
+    EveryTask,
+}
+
+/// The statement both chat listings run, differing only in the `is_active` predicate.
+fn list_sql(listing: TaskListing) -> String {
+    let active = match listing {
+        TaskListing::ActiveOnly => " AND is_active",
+        TaskListing::EveryTask => "",
+    };
+    format!(
+        "SELECT * FROM scheduled_task \
+         WHERE bot_id = $1 AND chat_id = $2{active} \
+         ORDER BY fire_at"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_active_listing_narrows_to_live_tasks() {
+        assert_eq!(
+            list_sql(TaskListing::ActiveOnly),
+            "SELECT * FROM scheduled_task \
+             WHERE bot_id = $1 AND chat_id = $2 AND is_active ORDER BY fire_at"
+        );
+        assert_eq!(
+            list_sql(TaskListing::EveryTask),
+            "SELECT * FROM scheduled_task \
+             WHERE bot_id = $1 AND chat_id = $2 ORDER BY fire_at"
+        );
     }
 }

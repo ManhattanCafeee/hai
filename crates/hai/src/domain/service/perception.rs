@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use crate::{
-    agentcore::embedding::EmbeddingService,
-    domain::{model::Perception, repo::Repos, vo::Source},
+    agentcore::api::embedding::EmbeddingService,
+    domain::{
+        model::Perception,
+        repo::Repos,
+        vo::{AttachmentParser, PerceptionId, Subject, SubjectKind},
+    },
     error::Result,
-    util::pgvector,
 };
 
 #[derive(Debug)]
@@ -20,94 +23,86 @@ impl PerceptionService {
 
     pub async fn find(
         &self,
-        source: &Source,
-        parser: &str,
+        subject: &Subject,
+        parser: AttachmentParser,
         focus: Option<&str>,
     ) -> Result<Option<Perception>> {
-        self.repos.perception.find(source, parser, focus).await
+        self.repos.perception.find(subject, parser, focus).await
     }
 
-    /// 批量按 file_id 查询（单次 round-trip；每文件全行——基础转写 + 针对性判断）。
-    pub async fn find_by_platform_file_ids(
-        &self,
-        file_ids: &[String],
-    ) -> Result<Vec<(String, Perception)>> {
-        if file_ids.is_empty() {
-            return Ok(Vec::new());
+    /// One round trip per subject kind; a file can yield several rows (base transcription plus
+    /// targeted readings). `Subject.value` is the `subject` column verbatim, so nothing re-adds a
+    /// platform prefix to an already-qualified handle.
+    pub async fn find_by_subjects(&self, subjects: &[Subject]) -> Result<Vec<Perception>> {
+        let mut rows = Vec::new();
+        for kind in [SubjectKind::Handle, SubjectKind::Url] {
+            let values: Vec<String> = subjects
+                .iter()
+                .filter(|s| s.kind == kind)
+                .map(|s| s.value.clone())
+                .collect();
+            if values.is_empty() {
+                continue;
+            }
+            rows.extend(
+                self.repos
+                    .perception
+                    .find_by_subjects(kind, &values)
+                    .await?,
+            );
         }
-        let sources: Vec<serde_json::Value> = file_ids
-            .iter()
-            .map(|fid| serde_json::to_value(Source::platform("telegram", fid)))
-            .collect::<serde_json::Result<_>>()?;
-        let rows = self.repos.perception.find_by_sources(&sources).await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|p| {
-                let Ok(Source::Platform { file_id, .. }) =
-                    serde_json::from_value::<Source>(p.source.clone())
-                else {
-                    return None;
-                };
-                Some((file_id, p))
-            })
-            .collect())
-    }
-
-    /// 批量按 URL 查询（单次 round-trip；全行）。
-    pub async fn find_by_urls(&self, urls: &[String]) -> Result<Vec<Perception>> {
-        if urls.is_empty() {
-            return Ok(Vec::new());
-        }
-        let sources: Vec<serde_json::Value> = urls
-            .iter()
-            .map(|u| serde_json::to_value(Source::url(u)))
-            .collect::<serde_json::Result<_>>()?;
-        self.repos.perception.find_by_sources(&sources).await
+        Ok(rows)
     }
 
     pub async fn upsert(
         &self,
-        source: &Source,
-        parser: &str,
+        subject: &Subject,
+        parser: AttachmentParser,
         focus: Option<&str>,
         content: &str,
     ) -> Result<Perception> {
-        if let Some(existing) = self.repos.perception.find(source, parser, focus).await? {
-            self.repos
-                .perception
-                .update_content(existing.id, content)
-                .await?;
-            let id = existing.id;
-            let content = content.to_string();
-            let embedding = Arc::clone(&self.embedding);
-            let pool = self.repos.pool().clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    pgvector::store_embedding(&*embedding, &pool, "perception", id, &content).await
-                {
-                    tracing::warn!(%id, "Failed to store perception embedding: {e}");
-                }
-            });
-            return Ok(existing);
-        }
+        // The row that comes out is the one this call wrote, not the one it read: the content is what
+        // the caller asked for either way. The only way the update finds nothing is a concurrent
+        // delete, and then a fresh row is what the caller wants.
+        let perception = match self.repos.perception.find(subject, parser, focus).await? {
+            Some(existing) => {
+                self.repos
+                    .perception
+                    .update_content(existing.id, content)
+                    .await?
+            }
+            None => None,
+        };
+        let perception = match perception {
+            Some(updated) => updated,
+            None => {
+                self.repos
+                    .perception
+                    .create(subject, parser, focus, content)
+                    .await?
+            }
+        };
+        self.spawn_embedding(perception.id, content);
+        Ok(perception)
+    }
 
-        let perception = self
-            .repos
-            .perception
-            .create(source, parser, focus, content)
-            .await?;
-        let id = perception.id;
-        let content = content.to_string();
+    /// Fire-and-forget on purpose: a perception row is a cache, so a missing vector only costs the
+    /// next read a recomputation.
+    fn spawn_embedding(&self, id: PerceptionId, content: &str) {
         let embedding = Arc::clone(&self.embedding);
-        let pool = self.repos.pool().clone();
+        let repo = self.repos.perception.clone();
+        let content = content.to_string();
         tokio::spawn(async move {
-            if let Err(e) =
-                pgvector::store_embedding(&*embedding, &pool, "perception", id, &content).await
-            {
+            let vector = match embedding.generate_embedding(&content).await {
+                Ok(vector) => vector,
+                Err(e) => {
+                    tracing::warn!(%id, "Failed to embed perception: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = repo.store_embedding(id, &vector).await {
                 tracing::warn!(%id, "Failed to store perception embedding: {e}");
             }
         });
-
-        Ok(perception)
     }
 }

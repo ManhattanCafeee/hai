@@ -5,9 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod error;
-pub mod infra;
-pub mod platform;
-pub mod rebuild;
+pub(crate) mod platform;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod util;
-
-pub use app::App;

@@ -10,7 +10,6 @@ pub struct Paths {
     config_dir: PathBuf,
     data_dir: PathBuf,
     config_file: PathBuf,
-    config_file_str: String,
     file_cache_dir: PathBuf,
     skill_dirs: Vec<PathBuf>,
 }
@@ -40,10 +39,6 @@ impl Paths {
         };
 
         let config_file = config_dir.join("config.toml");
-        let config_file_str = config_file
-            .to_str()
-            .expect("config file path is valid UTF-8")
-            .to_owned();
         let file_cache_dir = data_dir.join("files");
 
         let mut skill_dirs = vec![config_dir.join("skills")];
@@ -59,7 +54,6 @@ impl Paths {
             config_dir,
             data_dir,
             config_file,
-            config_file_str,
             file_cache_dir,
             skill_dirs,
         }
@@ -77,12 +71,17 @@ impl Paths {
         &self.config_file
     }
 
-    pub fn config_file_str(&self) -> &str {
-        &self.config_file_str
+    pub fn env_file(&self) -> PathBuf {
+        self.config_dir.join(".env")
     }
 
     pub fn file_cache_dir(&self) -> &Path {
         &self.file_cache_dir
+    }
+
+    /// The per-chat workspace roots: the one writable place a sandboxed agent has.
+    pub fn workspaces_dir(&self) -> PathBuf {
+        self.data_dir.join("workspaces")
     }
 
     pub fn skill_dirs(&self) -> &[PathBuf] {

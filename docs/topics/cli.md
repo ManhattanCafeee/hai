@@ -1,101 +1,76 @@
-# CLI / Event log TUI / rebuild
+# CLI / event log TUI / rebuild
 
-> Command-line entry point, db management commands, event log TUI, and embedding rebuild. Required reading when changing `cli.rs`, `cli/`, `rebuild.rs`, or `domain/db.rs`.
+> `hai`'s command surface: the management families, the destructive embedding rebuild, and the event-log TUI. Read before changing `cli.rs`, `cli/`, `cli/tui/`, `domain/db.rs` or `domain/repo/vector.rs`.
 
 ## Overview
 
-`hai` is the single binary. The CLI provides: starting the service, viewing configuration, db management, event log viewing/browsing (`log` TUI), and KnowledgeBase background management. For an overview of commands see the "Project custom commands" section in AGENTS.md (here we only record implementation semantics and parameter details).
+One binary, two modes: with no subcommand it starts the bot (`app/mod.rs:serve`), otherwise it runs one `config` / `db` / `log` / `kb` management command, assembled by `cli.rs:Cli::execute`, which loads `.env`, the config, then dispatches — a failure exits 1 after printing the error (`main.rs:main`). A management command never starts the platform layer (`log` and `kb` build their own pool), and `[model-roles.embedding]` is required for `db migrate`, `kb` and the rebuild (`docs/topics/config.md`) — the rebuild resolves that role alone, so it needs no chat model; the flags are the `clap` definitions behind `--help`.
 
 ## Design
 
-### Command structure
+### db
 
-Entry: `cli.rs:Cli` (clap Parser) + `cli.rs:Commands{Config, Db, Log, Kb}` + `DbAction{Create, Migrate, Rebuild}` + `RebuildTarget{Embeddings}` + `KbAction{Import, List, Search, Delete, Reindex}`; command implementation entry points: `cli/kb.rs:execute`, `cli/log.rs:execute`, `cli/tui/app.rs:run_tui`, `rebuild.rs:rebuild_embeddings`; `main.rs:main` = `Cli::parse().execute().await`.
+`create` rewrites the configured URL onto the `postgres` database (`domain/db.rs:create_database`) and issues `CREATE DATABASE`. `migrate` is one call into `domain/db.rs:migrate`, which runs `domain/db.rs:apply_schema` — `crates/hai/migrations/schema.sql`, then `domain/db.rs:normalize_legacy_columns`, which backfills legacy NULL `memory.source_message_ids` to `'{}'` and makes the column `NOT NULL DEFAULT '{}'` while dropping the stale DDL defaults the write paths now bind (`memory.status`, `account.last_active_at`, `topic.started_at`, `topic.last_active_at`) — and then `domain/repo/vector.rs:ensure_embedding_schema`, which adds the vector extension and the `embedding` column at the configured dimension. Nothing runs automatically, so a deploy must run this.
 
-All subcommands first load config: `AppConfigManager::from_file(Paths::inferred().config_file_str()).with_env(ENV_PREFIX)`.
+### rebuild embeddings (`cli/rebuild.rs:rebuild_embeddings`)
 
-### db commands (cli.rs + domain/db.rs)
+`domain/repo/vector.rs:reset_embedding_dimension` → `domain/repo/vector.rs:collect_embedding_jobs` → `run_batch` → `domain/repo/vector.rs:rebuild_embedding_indexes`: a destructive full rebuild rather than an incremental fill — `reset_embedding_dimension` drops and recreates every `embedding` column at the configured width (`domain/repo/vector.rs:EmbeddingTable`, whose arms are also the table list the jobs come from), discarding the stored vectors and the per-table index, before re-embedding every memory, perception and knowledge chunk plus topics with a non-empty summary. Writes are per row (`domain/repo/vector.rs:upsert_embedding_vec`): a failed row keeps a NULL embedding retrieval skips while successes stay committed, and counted failures end the run non-zero. The index is rebuilt last, since IVFFlat needs rows to build on.
 
-| Command | Behavior |
+### kb (`cli/kb.rs:execute`)
+
+`import` / `list` / `search` / `delete` / `reindex`; the CLI supplies files, collection and title, while content-hash idempotency, the chunker and `reindex`'s stale-version bypass belong to `docs/topics/domain.md`. Rules the flags do not express:
+
+- A directory is an error unless `--recursive` is given, and so is a file that is not `.md`/`.txt`.
+- `search` prints `p=` (the reranker's score) when reranking is configured, `d=` (the vector leg's L2 distance) otherwise, and `-` for a chunk only the lexical leg recalled.
+- A `---` block is frontmatter only when it holds a `key: value` line, so a document opening with a horizontal rule keeps its body; the title comes from that block, otherwise the file stem, and `--title` overrides both.
+
+### log (`cli/log.rs`)
+
+`--id N` prints one event in full through the same section renderer the TUI uses (`cli/display.rs:render_sections`); otherwise `--chat` and `--event` seed the TUI's query line as `chat:<id>` and `kind:<name>`, which from there on governs the window.
+
+### Event log TUI
+
+Three panes over one window — the chats the window holds, the timeline of turns, and the detail of one event — plus a query line that is not one of them: `/` opens it for as long as the reader is typing, `Enter`/`Tab` keep the terms and give the keyboard back, and `Esc` puts back the terms that were in effect when it opened. The detail shares the body with the timeline while it is open and takes all of it in fullscreen (`cli/tui/detail.rs:DetailLayout`). The key map is per mode: `cli/tui/action.rs:key_event` reads a key into a `cli/tui/action.rs:Action`, and `cli/tui/app.rs:App::update` applies it and returns the `cli/tui/action.rs:Effect`s the database has to run. Memory-only work happens where it was asked for; database-bound work runs in `cli/tui/app.rs:App::apply`, which keeps I/O off the key path.
+
+The keys, by mode — `cli/tui/action.rs:key_event` is the one place a key becomes an action:
+
+|where|keys|
 |---|---|
-| `db create` | `domain/db.rs:create_database(url)`: splits the admin URL to connect to the `postgres` database and create the database (`split_admin_url`) |
-| `db migrate` | `init_db` + `run_migrations` (schema.sql idempotent table creation) + `ensure_embedding_schema(dimension defaults to 1024)` — **migrations are not auto-applied** (must be run manually after deployment) |
-| `db rebuild embeddings` | See below |
+|any pane|`Tab`/`Shift-Tab` or `h`/`l` cycle the panes, `/` opens the query line, `?` help, `q`/`Ctrl-C` quit, `Esc` cancel|
+|chats|`j`/`k` move, `Enter` narrows the window to that chat, and again to widen it|
+|timeline|`j`/`k` move, `Enter` opens a turn or an event, `PageUp`/`PageDown` and `Ctrl+U`/`Ctrl+D` page, `g` the oldest loaded row and again for the page before it, `G` the newest and follow, `f` follow|
+|detail|`j`/`k` scroll, `PageUp`/`PageDown` and `Ctrl+U`/`Ctrl+D` scroll further, `Enter` shows every long field, `f` fullscreen, `Esc` closes it|
+|query line|types the terms; `Enter`/`Tab` keep them and close, `Esc` puts back the ones that were in effect|
 
-### rebuild embeddings (rebuild.rs:rebuild_embeddings)
+The timeline's unit is a turn: `cli/tui/event_store.rs:group_turns` groups the window into runs of one chat and turn number, a turn is one row that opens into the events inside it, and a record carrying no turn of its own — a wrap-up — stands alone. A selection names the row's event *and* whether it is a child row (`cli/tui/timeline.rs:RowKey`), because an open turn's first event is both its header and one of its children; `cli/tui/timeline.rs:clamp_offset` keeps the selected row in the upper third of the viewport, and a prepend restores its visual position so loading older events does not jump. A prepend can also hand a turn events that come before the one the reader was on, which moves that turn's own first row: the selection follows its event to the turn that holds it (`cli/tui/timeline.rs:Timeline::reselect`) instead of falling back to the head, where it would pull the next page in on the same tick. The window is a seq-ascending slice of matching events and only grows — `extend_back` prepends, `append_new` appends, neither trims — because trimming would evict browsed history and invalidate the selection; only the initial load trims to capacity, which `cli/tui/event_store.rs:set_viewport` derives from the viewport height.
 
-```txt
-init_db → ProviderRegistry::new(config)
-provider = embedding.provider_or(&agent.provider); model = embedding.model(); dimension = embedding.dimension() (defaults to 1024)
-ApiClient::new + registry.get_endpoint(provider, model)   # connect directly to provider, not through the EmbeddingService trait
-ensure_embedding_schema(dim)
-reset_embeddings: DROP INDEX idx_{t}_embedding + UPDATE ... SET embedding=NULL (4 tables)
-collect_jobs: Memory all; Topic only summary non-empty; Perception all; KnowledgeChunk all
-run_batch: Semaphore(MAX_CONCURRENT=10) + FuturesUnordered + indicatif progress bar
-  client.embed → UPDATE {table} SET embedding='{vec}'::vector WHERE id='{id}' (sqlx bind parameters)
-rebuild_indexes: CREATE INDEX ... USING ivfflat (embedding vector_cosine_ops) WITH (lists = max(10, sqrt(total)))
-```
+The query line is the filter. `chat:` and `kind:` are the terms the database can narrow by and are re-read as soon as they change (`cli/tui/app.rs:App::update` compares them with what the window was queried with); `tool:` (a glob), `turn:`, `slow:`, `err` and bare text are matched against the rows already in memory (`cli/tui/filter.rs:Terms::matches`). A query that does not parse leaves the last one that did in effect, so a half-typed value never disturbs the window; the header spells out what is in effect, which is not always what was typed — a token the grammar does not know is a search, not a filter.
 
-Failed count > 0 → `Err(Internal)` (with `{failed}/{total}` count). Index lifecycle see docs/topics/domain.md.
+Long fields fold: `cli/display.rs:Section` holds one field's lines, and the detail shows the first `cli/display.rs:PREVIEW_LINES` behind a `▸` plus a marker saying how much is hidden, until `Enter` unfolds every section.
 
-### Event log (log command + TUI)
-
-- `cli/log.rs:LogArgs{id?, chat?, event?}`; `--id N` → `cli/log.rs:show_detail` (`repos.event.by_seq(seq)` + `EventDisplay`, prints `time chat tag` header + separator line + detail_text); otherwise `run_tui(db, chat, event)`
-- `--event` help text uses kebab-case examples (`turn-started, tool-call, turn-ended` etc.), consistent with the stored tag
-
-**Rendering (cli/display.rs)**:
-
-- `EventDisplay{tag, one_liner, detail_text, chat_id, color}`: generates a one-line summary + detail per the 9 AgentEventPayload variants; `tag_for_kind`: TURN/TOOL/STEP/DONE/RETRY/FAIL/STEER/WRAP (TOOL covers tool-call and tool-call-result, WRAP covers wrap-up-started and wrap-up-completed — the storage layer only has a single turn-ended tag; FAIL/STEER filtering is currently equivalent to DONE, see Pitfalls)
-- `color_rgb(payload)` colors by event type; `fmt_time` (same-day `%H:%M:%S`, cross-day `%m-%d %H:%M`, local timezone); `chat_display` (`{:+}` with sign)
-- wrap-up event display: `WrapUpStarted` → `WRAP start`; `WrapUpCompleted{step_count}` → `WRAP N steps`; `WrapUpFailed{error}` → `FAIL wrap-up {error}`
-- event queries go through `domain/repo/event.rs:EventRepo::query`: dynamic SQL (conditions concatenated with `$N` placeholders) + JSONB filter `(payload::jsonb->>'chat_id')::bigint` / `payload::jsonb->>'event'`, parameterized bind
-
-### TUI (cli/tui/)
-
-`cli/tui/app.rs:run_tui(db, chat_filter, kind_filter) -> crate::error::Result<()>` (ratatui + crossterm, no anyhow). Three-panel componentization: `App` (loop + dispatch, holds store/focus/three components/pending queue) + `Filter` + `Events` + `Detail`; components do not hold data, they communicate via the `app.rs:Cmd` enum — synchronous commands execute immediately, async (reload-like) ones go into the pending queue and are consumed on tick.
-
-**Layout**: left column 60% vertically split into **filter** (top, 5 rows including border) + **events** (bottom); right column 40% **detail**; Enter in the detail area toggles fullscreen (`DetailLayout`). On startup it loads the latest events and opens detail.
-
-**filter panel (Filter, three `FilterRow` rows)**: text row input filters immediately (local window), Backspace triggers rebuild; chat row numeric input submitted with Enter (DB reload); type row `(all)` + 8 type horizontal shortcuts (TURN/TOOL/STEP/DONE/RETRY/FAIL/STEER/WRAP, `display.rs:KIND_TAGS`), ←/→ cycles and applies immediately; row focus j/k (when the text row is focused j/k are character input, only ↓ switches row).
-
-**Event list and stepless scrolling (Events)**: anchored by `visible_seq` + `selected_seq` (window changes restore by seq without drift); the selected row stays in the upper 1/3 of the viewport (`clamp_offset`, scrolloff = vp_h/3); PgUp/Dn = half page, Ctrl+U/D = 1/4 page; scrolling to the top auto-loads older events (`visual_pos` + `anchor_after_prepend` visual anchoring, `back_loading` prevents duplicates).
-
-**Scroll-driven loading**: `app.rs:POLL_MS`=200 tick polls `event_store.rs:count_new` (only counts matching events with seq > max) → header `+N new (G to load)`; at the bottom with new events → append load (`Cmd::AppendNew`); `events.rs:auto_loaded` prevents automatically catching up continuously when stopped at the bottom; when not in follow mode new events only show +N new, press G to load the latest.
-
-**Keys (vim style, reused by focus context)**:
-
-| Key | filter | events | detail |
-|---|---|---|---|
-| j/k | row switch (except text row) | navigation | scroll |
-| ←/→ | text/chat cursor / type switch | — | — |
-| Tab / l | → Events | → Detail | → Filter |
-| h | — | → Filter | → Events |
-| Enter | chat submit | open/close detail | fullscreen toggle |
-| Esc | cancel chat edit | close detail / clear error | close detail |
-| g / G | — | earliest / latest | — |
-| PgUp/PgDn | — | half page | 10 rows |
-| Ctrl+U / Ctrl+D | — | 1/4 page | 15 rows |
-| `/` / `c` | — | jump to text row / jump to chat row | — |
-| `?` | help popup (global) | | |
-| q / Ctrl+C | exit (q is a character while typing text; Ctrl+C always exits) | | |
-
-Esc priority: clear error → cancel chat row edit → close detail (`app.rs:handle_key` tries them in order).
-
-**Data layer (event_store.rs:EventStore)**: seq-ascending growing window — neither `extend_back` (prepend) nor `append_new` (append) trims (keeps selection and continued loading while browsing history; session-level memory); `set_viewport` makes capacity = max(lines*3, 400), only constraining a single query's limit; boundaries are determined by "query returns 0 rows" (`at_start`/`at_end`), transient errors do not pollute boundaries; `display_by_seq` parse cache (each event deserialized only once, cache cleaned when exceeding capacity×4).
-
-**Terminal safety and rendering**: `TerminalGuard` RAII (Drop restores raw mode + alternate screen); crossterm `EventStream` + dirty-flag redraw (draws only on change, no 100Hz idle spin); header `hai Chat +N X/Y events`; bottom error bar in red (cleared with Esc).
-
-**Filtering & DB**: chat/type filtering is AND-combined at the DB layer (`load_end` re-queries); text filtering is in the local window (one_liner + seq number + chat_id numeric string, case-insensitive); **the SQL for chat/type filtering and count_new all use the `payload::jsonb` cast** — the payload column is TEXT/JSONB dual-form compatible, `->>` only applies to jsonb (see Pitfalls).
+New events are counted and offered (`G` loads them) unless the reader is following the tail (`f`), where the tick appends them; with the selection parked at the oldest loaded row the tick pulls in the page before it.
 
 ## Boundaries
 
-- CLI and library are in the same crate (db management logic can be shared between app and CLI)
-- No event editing/deletion/export; no multi-session (multiple chats at once) view; no migration of historical log data
+- The event log is read-only — no editing, deletion, export or retention policy — and the filters select one chat.
+
+## Trade-offs and Reasons
+
+- **Only a term that changes the *set* of events goes back to the database.** The window is already in memory, so a keystroke refilters it (case-insensitive over the one-liner, seq and chat id) with no round trip; `chat:` and `kind:` change what the query returns, so they are re-read at once instead of on a timer.
+- **A turn's summary is its start record's line.** The header row reuses that rendering rather than parsing the reason and the message count back out of it, and a turn whose start is older than the window says so instead of passing a child off as the turn.
+- **Following lands on the newest turn, not on the newest record.** A stream of wrap-ups would otherwise pull the reader off the last thing that happened, so a record with no turn of its own never takes the selection.
 
 ## Pitfalls / common mistakes
 
-- rebuild inserts vectors with sqlx bind (`$1::vector` — value formatted from Vec<f32>, parameterized binding)
-- **the payload column is JSONB** (phase 2 refactor: TEXT→JSONB, `payload->>` works directly; `raw_query` and `count_new` have removed the cast — if reverting to TEXT, the explicit cast must be restored)
-- **sqlx placeholders `$N`** (Postgres dialect) — hand-written SQL numbers binds in condition order (dynamic SQL is wrapped with `sqlx::AssertSqlSafe`)
-- **raw_query condition fragments start with "AND " but the join adds no space**: a space must be added before the first condition, otherwise it concatenates to `WHERE seq > 0AND…`
-- Legacy: the event log window grows with the session and is not trimmed (session-level memory; watch out for very long runs + high-frequency events); `db migrate` currently adds query indexes / idempotent key constraints (in schema.sql), while the embedding IVFFlat index is still built by `db rebuild embeddings` (l2_ops)
+- **`event.payload` is JSONB**, filtered as `(payload->>'chat_id')::bigint` and `payload->'payload'->>'event'`; the expression indexes in `crates/hai/migrations/schema.sql` must spell them identically or the query stops using them, and the chat id's explicit `::bigint` cast is what matches the numeric index.
+- **`$N` placeholders are numbered by hand** in `domain/repo/event.rs:push_filters` and the two statement builders that call it (`domain/repo/event.rs:query_sql`, `:count_after_sql`), over raw SQL under `sqlx::AssertSqlSafe`, so a mis-numbered bind fails at runtime.
+- **Condition fragments must keep their leading space**: the base statement ends in `WHERE seq > 0`, so an appended fragment has to start with `" AND …"`.
+- **`db migrate` does not create the vector index**, so without a rebuild retrieval scans instead of using IVFFlat — and that rebuild nulls every embedding first.
+- **A `kind:` term is coarser than its label**: one stored tag covers every `turn-ended` outcome, so `kind:turn-ended` also shows the turn that failed (`docs/architecture.md`).
+- **A query term is a key only where the grammar says so**: `slow` alone is a search for that word, `slow:abc` is a refusal — and the header spells out which one the reader is looking at.
+- **A turn number restarts with every chapter** (`agent/runtime/chat/conversation.rs:Conversation::turn_count`), so `(chat, turn)` names several turns over a log's life: a `turn:` term matches each chapter's turn of that number, and the TUI remembers an opened turn by its own first record instead (`cli/tui/event_store.rs:TurnGroup::anchor`).
+- **Input waits first, the log polls on a timeout** (`cli/tui/guard.rs:InputReader` plus the timeout in `cli/tui/app.rs:App::run`): a `select!` that races input against a timer drains a key burst at the timer's pace, which is 230 ms per key against 0.9 ms once input comes first — and it also makes a single keypress wait for the timer.
+
+## Evolution Direction
+
+- A turn's outcome is read from the rendered payload, so filtering by one (`err`, `slow:`) only sees the window; doing it in the query would need a filterable discriminator in storage.

@@ -1,46 +1,39 @@
 pub mod env;
-pub mod manager;
+pub mod issue;
+pub mod load;
 pub mod meta;
+pub mod model_role;
 pub mod paths;
 pub mod provider_manager;
 pub mod schema;
 
 use std::collections::HashMap;
 
-pub use manager::Config;
+pub use issue::ConfigIssue;
 pub use paths::Paths;
 pub use provider_manager::ProviderRegistry;
 use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
-use struct_patch::Patch;
 
-use crate::config::{
-    manager::Configurable,
-    schema::{
-        AgentConfig, AuxiliaryConfig, BotConfigRaw, DatabaseConfig, KnowledgeConfig, LoggingConfig,
-        McpConfig, ProviderConfig, SandboxConfig, SkillsConfig,
-    },
+use crate::config::schema::{
+    AgentConfig, ChannelSection, DatabaseConfig, KnowledgeConfig, LoggingConfig, ModelRolesConfig,
+    PromptConfig, ProviderConfig, SandboxConfig, SkillsConfig, ToolsConfig, WebConfig,
 };
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch, Default)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(rename_all = "kebab-case")]
+/// The whole config; [`AppConfig::load`] resolves it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AppConfig {
     pub agent: AgentConfig,
+    pub prompt: PromptConfig,
     pub knowledge: KnowledgeConfig,
     pub providers: HashMap<String, ProviderConfig>,
-    pub auxiliary: AuxiliaryConfig,
-    pub bot: HashMap<String, BotConfigRaw>,
-    pub mcp: HashMap<String, McpConfig>,
+    pub model_roles: ModelRolesConfig,
+    pub web: WebConfig,
+    pub channel: HashMap<String, ChannelSection>,
+    pub mcp: HashMap<String, crate::agentcore::mcp::McpConfig>,
     pub sandbox: SandboxConfig,
     pub skills: SkillsConfig,
+    pub tools: ToolsConfig,
     pub logging: LoggingConfig,
     pub database: DatabaseConfig,
 }
-
-impl Configurable for AppConfig {
-    type Patch = AppConfigPatch;
-}
-
-pub type AppConfigManager = Config<AppConfig>;

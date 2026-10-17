@@ -1,14 +1,14 @@
 use serde::{Deserialize, Serialize};
-use strum::{Display, EnumString, IntoStaticStr};
+use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
-use crate::domain::vo::AccountId;
+use crate::domain::vo::{AccountId, IdentityId, PlatformAccountMeta, enum_column};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Account {
-    pub id: i64,
-    pub identity_id: Option<uuid::Uuid>,
+    pub id: AccountId,
+    pub identity_id: Option<IdentityId>,
 
-    pub platform: String,
+    pub platform: Platform,
     pub external_id: String,
     pub meta: Option<serde_json::Value>,
 
@@ -21,18 +21,36 @@ pub struct Account {
 }
 
 impl Account {
-    pub fn id_(&self) -> AccountId {
-        AccountId(self.id)
+    /// The platform's own record of this account, when the row carries one this build can read.
+    pub fn platform_meta(&self) -> Option<PlatformAccountMeta> {
+        PlatformAccountMeta::deserialize(self.meta.as_ref()?).ok()
     }
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Display, EnumString, IntoStaticStr, Serialize, Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Display,
+    EnumIter,
+    EnumString,
+    IntoStaticStr,
+    Serialize,
+    Deserialize,
 )]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
-    System,
     Telegram,
-    Qq,
 }
+
+impl Platform {
+    /// The column value, the cache-key prefix and the serde name are this one spelling.
+    pub fn as_str(&self) -> &'static str {
+        (*self).into()
+    }
+}
+
+enum_column!(Platform);

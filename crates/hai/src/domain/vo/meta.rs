@@ -1,19 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-/// Agent 消息元数据
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentMessageMeta {
-    pub model: String,
-}
-
-/// 平台账号元数据（方便扩展多平台）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "platform")]
 pub enum PlatformAccountMeta {
     Telegram(TelegramAccountMeta),
 }
 
-/// Telegram 账号元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TelegramAccountMeta {
     pub first_name: String,
@@ -40,37 +32,55 @@ impl PlatformAccountMeta {
     }
 }
 
-/// 大模型消息元数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmMessageMeta {
     pub model: String,
-    /// 大模型 reasoning 内容
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 }
 
-/// 消息元数据（顶层结构，包含通用字段和平台特定字段）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageMeta {
-    /// 平台特定信息
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub platform: Option<PlatformMessageMeta>,
-    /// 大模型信息（如果是 AI 消息）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmMessageMeta>,
 }
 
-/// 平台消息元数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "platform")]
 pub enum PlatformMessageMeta {
     Telegram(TelegramMessageMeta),
 }
 
-/// Telegram 消息元数据
+impl PlatformMessageMeta {
+    /// The part of the message the sender chose to point at, when the platform carries one: a quote
+    /// the platform added by itself says nothing a reference preview does not already show.
+    pub fn excerpt(&self) -> Option<&str> {
+        match self {
+            Self::Telegram(meta) => meta
+                .quote
+                .as_ref()
+                .filter(|quote| quote.is_manual)
+                .map(|quote| quote.text.as_str()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TelegramMessageMeta {
-    /// 消息是否来自话题
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_thread_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<TelegramQuote>,
+}
+
+/// The part of a message a reference points at. Telegram fills this in for a reply that quotes an
+/// excerpt; `is_manual` tells a chosen excerpt apart from one the server added by itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramQuote {
+    pub text: String,
+    /// Position of the quoted part in the original message, in UTF-16 code units.
+    pub position: u32,
+    pub is_manual: bool,
 }

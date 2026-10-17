@@ -1,7 +1,13 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::{domain::model::Event, error::Result};
+use crate::{
+    domain::{
+        model::Event,
+        vo::{ChatId, EventKind},
+    },
+    error::Result,
+};
 
 #[derive(Debug, Clone)]
 pub struct EventRepo {
@@ -13,59 +19,31 @@ impl EventRepo {
         Self { pool }
     }
 
-    pub async fn insert(&self, domain: &str, payload: Value) -> Result<Event> {
-        sqlx::query_as::<_, Event>(
-            "INSERT INTO event (domain, payload) VALUES ($1, $2) RETURNING *",
-        )
-        .bind(domain)
-        .bind(payload)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
+    pub async fn insert(&self, payload: Value) -> Result<Event> {
+        sqlx::query_as::<_, Event>("INSERT INTO event (payload) VALUES ($1) RETURNING *")
+            .bind(payload)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
     }
 
-    /// 事件查询：可选 JSONB 过滤（chat_id / kind tag）、seq 范围、方向与 limit。
-    /// 结果按 seq 排序（`desc=true` 降序 / `false` 升序）。
     pub async fn query(
         &self,
-        chat_id: Option<i64>,
-        kind: Option<&str>,
+        chat_id: Option<ChatId>,
+        kind: Option<EventKind>,
         before_seq: Option<i64>,
         after_seq: Option<i64>,
         desc: bool,
         limit: usize,
     ) -> Result<Vec<Event>> {
-        let mut sql =
-            String::from("SELECT seq, domain, payload, created_at FROM event WHERE seq > 0");
-        let mut n = 0usize;
-        if let Some(_cid) = chat_id {
-            n += 1;
-            sql.push_str(&format!(" AND (payload->>'chat_id')::bigint = ${n}"));
-        }
-        if let Some(_k) = kind {
-            n += 1;
-            sql.push_str(&format!(" AND payload->'payload'->>'event' = ${n}"));
-        }
-        if let Some(_b) = before_seq {
-            n += 1;
-            sql.push_str(&format!(" AND seq < ${n}"));
-        }
-        if let Some(_a) = after_seq {
-            n += 1;
-            sql.push_str(&format!(" AND seq > ${n}"));
-        }
-        let limit_idx = n + 1;
-        sql.push_str(&format!(
-            " ORDER BY seq {} LIMIT ${limit_idx}",
-            if desc { "DESC" } else { "ASC" },
-        ));
+        let sql = query_sql(chat_id, kind, before_seq, after_seq, desc);
 
         let mut q = sqlx::query_as::<_, Event>(sqlx::AssertSqlSafe(sql.as_str()));
         if let Some(cid) = chat_id {
-            q = q.bind(cid);
+            q = q.bind(cid.0);
         }
         if let Some(k) = kind {
-            q = q.bind(k);
+            q = q.bind(k.as_str());
         }
         if let Some(b) = before_seq {
             q = q.bind(b);
@@ -73,14 +51,13 @@ impl EventRepo {
         if let Some(a) = after_seq {
             q = q.bind(a);
         }
-        // LIMIT 占位符编号最大（$limit_idx），最后绑定
         q = q.bind(limit as i64);
         Ok(q.fetch_all(&self.pool).await?)
     }
 
     pub async fn by_seq(&self, seq: i64) -> Result<Option<Event>> {
         sqlx::query_as::<_, Event>(
-            "SELECT seq, domain, payload, created_at \
+            "SELECT seq, payload, created_at \
              FROM event WHERE seq = $1 LIMIT 1",
         )
         .bind(seq)
@@ -89,30 +66,104 @@ impl EventRepo {
         .map_err(Into::into)
     }
 
-    /// 统计 seq > after 的匹配事件数（chat_id/kind 可选过滤）。
     pub async fn count_after(
         &self,
         after_seq: i64,
-        chat_id: Option<i64>,
-        kind: Option<&str>,
+        chat_id: Option<ChatId>,
+        kind: Option<EventKind>,
     ) -> Result<i64> {
-        let mut sql = String::from("SELECT COUNT(*) FROM event WHERE seq > $1");
-        let mut n = 1usize;
-        if let Some(_cid) = chat_id {
-            n += 1;
-            sql.push_str(&format!(" AND (payload->>'chat_id')::bigint = ${n}"));
-        }
-        if let Some(_k) = kind {
-            n += 1;
-            sql.push_str(&format!(" AND payload->'payload'->>'event' = ${n}"));
-        }
+        let sql = count_after_sql(chat_id, kind);
         let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str())).bind(after_seq);
         if let Some(cid) = chat_id {
-            q = q.bind(cid);
+            q = q.bind(cid.0);
         }
         if let Some(k) = kind {
-            q = q.bind(k);
+            q = q.bind(k.as_str());
         }
         Ok(q.fetch_one(&self.pool).await?)
+    }
+}
+
+/// Appends the `chat_id` and `event` predicates a filtered query carries, each with its leading
+/// space, and returns the index of the last placeholder bound. The JSONB spellings must keep
+/// matching the expression indexes in `schema.sql`.
+fn push_filters(
+    sql: &mut String,
+    n: usize,
+    chat_id: Option<ChatId>,
+    kind: Option<EventKind>,
+) -> usize {
+    let mut n = n;
+    if chat_id.is_some() {
+        n += 1;
+        sql.push_str(&format!(" AND (payload->>'chat_id')::bigint = ${n}"));
+    }
+    if kind.is_some() {
+        n += 1;
+        sql.push_str(&format!(" AND payload->'payload'->>'event' = ${n}"));
+    }
+    n
+}
+
+/// The statement `query` runs: the shared predicate, then the sequence window, then `LIMIT` last.
+fn query_sql(
+    chat_id: Option<ChatId>,
+    kind: Option<EventKind>,
+    before_seq: Option<i64>,
+    after_seq: Option<i64>,
+    desc: bool,
+) -> String {
+    let mut sql = String::from("SELECT seq, payload, created_at FROM event WHERE seq > 0");
+    let mut n = push_filters(&mut sql, 0, chat_id, kind);
+    if before_seq.is_some() {
+        n += 1;
+        sql.push_str(&format!(" AND seq < ${n}"));
+    }
+    if after_seq.is_some() {
+        n += 1;
+        sql.push_str(&format!(" AND seq > ${n}"));
+    }
+    let limit_idx = n + 1;
+    sql.push_str(&format!(
+        " ORDER BY seq {} LIMIT ${limit_idx}",
+        if desc { "DESC" } else { "ASC" },
+    ));
+    sql
+}
+
+/// The statement `count_after` runs: `after_seq` owns `$1`, so the shared predicate starts at `$2`.
+fn count_after_sql(chat_id: Option<ChatId>, kind: Option<EventKind>) -> String {
+    let mut sql = String::from("SELECT COUNT(*) FROM event WHERE seq > $1");
+    push_filters(&mut sql, 1, chat_id, kind);
+    sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_statement_binds_its_filters_windows_and_limit_in_order() {
+        let chat = Some(ChatId(7));
+        assert_eq!(
+            query_sql(None, None, None, None, false),
+            "SELECT seq, payload, created_at FROM event WHERE seq > 0 \
+             ORDER BY seq ASC LIMIT $1"
+        );
+        assert_eq!(
+            query_sql(chat, Some(EventKind::ToolCall), Some(9), Some(3), true),
+            "SELECT seq, payload, created_at FROM event WHERE seq > 0 \
+             AND (payload->>'chat_id')::bigint = $1 AND payload->'payload'->>'event' = $2 \
+             AND seq < $3 AND seq > $4 ORDER BY seq DESC LIMIT $5"
+        );
+        assert_eq!(
+            count_after_sql(chat, Some(EventKind::ToolCall)),
+            "SELECT COUNT(*) FROM event WHERE seq > $1 \
+             AND (payload->>'chat_id')::bigint = $2 AND payload->'payload'->>'event' = $3"
+        );
+        assert_eq!(
+            count_after_sql(None, None),
+            "SELECT COUNT(*) FROM event WHERE seq > $1"
+        );
     }
 }

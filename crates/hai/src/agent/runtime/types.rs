@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use genai::chat::ChatMessage;
 
-use super::event::WakeEvents;
-use crate::domain::vo::Step;
+use crate::{agentcore::tool::AgentTool, domain::vo::Step};
 
-/// CoW 消息容器。沿整条 turn 链路共享，clone = Arc bump。
 #[derive(Clone)]
 pub struct Messages(Arc<Vec<ChatMessage>>);
 
@@ -31,20 +29,69 @@ impl Messages {
     }
 }
 
-/// Turn 结束后返回给 session 的数据。
 pub struct TurnOutput {
     pub messages: Messages,
     pub steps: Vec<Step>,
+    pub has_spoken: bool,
 }
 
-/// Busy 态的完成信号：一次 turn / steering 打断 / 收尾 的结果。
-/// 失败变体按来源区分（turn vs 收尾）——事件循环据此决定是否抑制 token 阈值触发。
+pub(crate) fn has_spoken(steps: &[Step], tools: &[Arc<dyn AgentTool>]) -> bool {
+    steps
+        .iter()
+        .flat_map(|s| &s.tool_calls)
+        .any(|tc| tools.iter().any(|t| t.name() == tc.tool_name && t.speaks()))
+}
+
+/// The completion signal of a Busy state: the outcome of a turn, of a steering interruption, or of
+/// a wrap-up.
 pub(crate) enum BusySignal {
     Turn(TurnOutput),
-    /// 提前正常结束（turn 期间新事件打断，steering）：已处理内容生效，
-    /// 附带打断事件（立即增量续跑新 turn）。
-    Steered(TurnOutput, WakeEvents),
-    WrapUp(String),
+    /// Ended early because something new arrived mid-turn (steering): everything already
+    /// processed takes effect, and the arrival starts the next turn right away.
+    Steered(TurnOutput),
+    WrapUp {
+        summary: String,
+        context_tokens: u32,
+    },
     TurnFailed,
     WrapUpFailed(String),
+    /// Cut short because the process is stopping: nothing is consumed, so the next start reads the
+    /// same accumulation again.
+    Cancelled,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::has_spoken;
+    use crate::{
+        agent::test_support::StubTool,
+        agentcore::tool::AgentTool,
+        domain::vo::{Step, ToolCallResult},
+    };
+
+    fn step(tool: &str) -> Step {
+        Step {
+            tool_calls: vec![ToolCallResult::ok(tool, json!({}), json!({"ok": true}))],
+            response: String::new(),
+            reasoning: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn has_spoken_follows_tool_metadata() {
+        let tools: Vec<Arc<dyn AgentTool>> = vec![
+            StubTool::new("send_message").speaks(true).into_dyn(),
+            StubTool::new("topic").into_dyn(),
+        ];
+
+        assert!(has_spoken(&[step("send_message")], &tools));
+        assert!(!has_spoken(&[step("topic")], &tools));
+        assert!(!has_spoken(&[step("unknown_tool")], &tools));
+    }
 }

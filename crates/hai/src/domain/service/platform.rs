@@ -1,8 +1,8 @@
 use crate::{
     domain::{
-        model::{Account, Chat, ChatType, Platform},
-        repo::Repos,
-        vo::{AccountId, ChatId, IdentityId},
+        model::{Account, Chat, ChatType, Message, NewChat, Platform},
+        repo::{PlatformChange, Repos},
+        vo::{AccountId, ChannelKey, ChatId, IdentityId},
     },
     error::Result,
 };
@@ -15,6 +15,11 @@ pub struct PlatformService {
 impl PlatformService {
     pub fn new(repos: Repos) -> Self {
         Self { repos }
+    }
+
+    /// One incoming platform change: the message row and its `ChatEntry` land together.
+    pub async fn apply_platform_change(&self, change: PlatformChange) -> Result<Message> {
+        self.repos.ingest.apply(change).await
     }
 
     pub async fn ensure_chat_and_account(
@@ -35,20 +40,19 @@ impl PlatformService {
         Ok((chat, account))
     }
 
-    pub async fn get_or_create_account(
+    async fn get_or_create_account(
         &self,
         platform: Platform,
         external_id: &str,
         meta: Option<serde_json::Value>,
     ) -> Result<Account> {
-        let platform_str: &str = platform.into();
         if let Some(account) = self
             .repos
             .account
-            .by_platform_external_id(platform_str, external_id)
+            .by_platform_external_id(platform, external_id)
             .await?
         {
-            // 活动刷新（消息路径每次活动更新——last_active_at 语义即最后活动）
+            // Best-effort: a failed refresh must not fail the message path.
             if let Err(e) = self
                 .repos
                 .account
@@ -62,7 +66,7 @@ impl PlatformService {
         let now = jiff::Timestamp::now();
         self.repos
             .account
-            .create(platform_str, external_id, meta, now, now, now)
+            .create(platform, external_id, meta, now, now, now)
             .await
     }
 
@@ -74,12 +78,10 @@ impl PlatformService {
         name: Option<&str>,
         meta: Option<serde_json::Value>,
     ) -> Result<Chat> {
-        let platform_str: &str = platform.into();
-        let chat_type_str: &str = chat_type.into();
         if let Some(chat) = self
             .repos
             .chat
-            .by_platform_external_id(platform_str, external_id)
+            .by_platform_external_id(platform, external_id)
             .await?
         {
             return Ok(chat);
@@ -87,44 +89,51 @@ impl PlatformService {
         let now = jiff::Timestamp::now();
         self.repos
             .chat
-            .create(
-                platform_str,
-                external_id,
-                chat_type_str,
-                name,
+            .create(NewChat {
+                platform,
+                external_id: external_id.to_owned(),
+                chat_type,
+                name: name.map(str::to_owned),
                 meta,
-                now,
-                now,
-            )
+                created_at: now,
+                updated_at: now,
+            })
             .await
     }
 
     pub async fn get_chat_by_id(&self, id: ChatId) -> Result<Option<Chat>> {
-        match self.repos.chat.by_id(id.0).await {
-            Ok(chat) => Ok(chat),
-            Err(e) => {
-                tracing::warn!(chat_id = %id, "get_chat_by_id failed: {e}");
-                Ok(None)
-            }
-        }
+        self.repos.chat.by_id(id).await
     }
 
     pub async fn get_account_by_id(&self, id: AccountId) -> Result<Option<Account>> {
-        match self.repos.account.by_id(id.0).await {
-            Ok(account) => Ok(account),
-            Err(e) => {
-                tracing::warn!(account_id = %id, "get_account_by_id failed: {e}");
-                Ok(None)
-            }
-        }
+        self.repos.account.by_id(id).await
     }
 
     pub async fn get_identity_accounts(&self, identity_id: IdentityId) -> Result<Vec<Account>> {
-        self.repos.account.by_identity_id(identity_id.0).await
+        self.repos.account.by_identity_id(identity_id).await
     }
 
-    pub async fn ensure_bot_account(&self) -> Result<Account> {
-        self.get_or_create_account(Platform::System, "bot", None)
+    pub async fn ensure_bot_account(
+        &self,
+        platform: Platform,
+        key: &ChannelKey,
+    ) -> Result<Account> {
+        // The account a channel speaks through, keyed `bot:<channel key>`: the prefix keeps a second
+        // bot on the same platform from colliding with the first, and the spelling is what the
+        // deploy's account rows must carry.
+        let external_id = format!("bot:{key}");
+        // A database written before the bot account carried its key holds one shared `(system, bot)`
+        // row; adopting it keeps the history that references its id (the `own` marking in the
+        // render) pointing at the account this build sends through.
+        if let Some(account) = self
+            .repos
+            .account
+            .adopt_legacy_bot_account(platform, &external_id)
+            .await?
+        {
+            return Ok(account);
+        }
+        self.get_or_create_account(platform, &external_id, None)
             .await
     }
 }

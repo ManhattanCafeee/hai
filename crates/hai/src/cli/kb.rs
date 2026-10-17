@@ -1,24 +1,23 @@
-//! `hai kb` 子命令：知识库管理（CLI 入口，后台管理面）。
-
 use std::path::{Path, PathBuf};
 
 use crate::{
-    agent::multimodal::MultimodalService,
-    config::{AppConfig, ProviderRegistry},
-    domain::{db, repo::Repos, service::DbServices, vo::KnowledgeDocumentId},
-    error::{ErrorKind, Result},
-    util::chunking::ChunkCfg,
+    config::AppConfig,
+    domain::{
+        service::{Services, chunking::ChunkCfg},
+        vo::{Collection, KnowledgeDocumentId},
+    },
+    error::{AppError, Result, bail},
 };
 
-/// 支持的导入扩展名（首版：文本/Markdown）。
 const IMPORT_EXTENSIONS: [&str; 2] = ["md", "txt"];
 
-/// 构建知识库操作所需的 service 装配（对齐 AppContext 装配顺序）。
-pub async fn build_services(config: &AppConfig) -> Result<DbServices> {
-    let registry = ProviderRegistry::new(config)?;
-    let multimodal = MultimodalService::from_config(config, &registry)?;
-    let pool = db::init_db(&config.database).await?;
-    Ok(DbServices::new(Repos::new(pool), multimodal))
+/// The CLI spells a collection as a plain label; the empty string is the uncategorised bucket.
+fn collection_of(label: &str) -> Collection {
+    Collection::try_from(label).expect("Collection accepts every label")
+}
+
+pub async fn build_services(config: &AppConfig) -> Result<Services> {
+    Ok(crate::agent::runtime::assemble(config).await?.services)
 }
 
 pub fn chunk_cfg(config: &AppConfig) -> ChunkCfg {
@@ -45,7 +44,7 @@ pub async fn execute(action: super::KbAction, config: &AppConfig) -> Result<()> 
                 collection.as_deref(),
                 title.as_deref(),
                 recursive,
-                &cfg,
+                config,
             )
             .await
         }
@@ -61,9 +60,10 @@ pub async fn execute(action: super::KbAction, config: &AppConfig) -> Result<()> 
             Ok(())
         }
         super::KbAction::Reindex { collection } => {
+            let collection = collection.as_deref().map(collection_of);
             let n = services
                 .knowledge
-                .reindex(collection.as_deref(), &cfg)
+                .reindex(collection.as_ref(), &cfg)
                 .await?;
             println!("Reindexed {n} document(s).");
             Ok(())
@@ -71,19 +71,18 @@ pub async fn execute(action: super::KbAction, config: &AppConfig) -> Result<()> 
     }
 }
 
-// ── import ──────────────────────────────────────────────────────────────────
-
 async fn import(
-    services: &DbServices,
+    services: &Services,
     paths: &[PathBuf],
     collection: Option<&str>,
     title_override: Option<&str>,
     recursive: bool,
-    cfg: &ChunkCfg,
+    config: &AppConfig,
 ) -> Result<()> {
+    let cfg = chunk_cfg(config);
     let files = collect_files(paths, recursive)?;
     if files.is_empty() {
-        return Err(ErrorKind::BadRequest.msg("no importable files (.md/.txt) found"));
+        bail!(AppError::message("no importable files (.md/.txt) found"));
     }
 
     let bar = if files.len() > 1 {
@@ -97,7 +96,7 @@ async fn import(
     let mut failures: Vec<(String, String)> = Vec::new();
 
     for path in &files {
-        let result = import_one(services, path, collection, title_override, cfg).await;
+        let result = import_one(services, path, collection, title_override, &cfg).await;
         match result {
             Ok(true) => imported += 1,
             Ok(false) => skipped += 1,
@@ -115,38 +114,44 @@ async fn import(
         "Imported {imported}, skipped {skipped} (unchanged), failed {}.",
         failures.len()
     );
+    if !config.knowledge.enabled {
+        println!(
+            "  note: [knowledge] enabled = false — the agent will not mount search_knowledge_base"
+        );
+    }
     for (path, err) in &failures {
         println!("  failed: {path}: {err}");
     }
     if !failures.is_empty() {
-        // 单文件失败多为用户输入问题（不可读/非 UTF-8），聚合为 BadRequest
-        // （Internal 会命中 is_internal_error → tracing::error!，把用户错误当内部故障刷日志）
-        return Err(
-            ErrorKind::BadRequest.msg(format!("{} file(s) failed to import", failures.len()))
-        );
+        return Err(AppError::message(format!(
+            "{} file(s) failed to import",
+            failures.len()
+        )));
     }
     Ok(())
 }
 
-/// 导入单个文件。返回 true = 导入/更新，false = 内容未变跳过。
+/// Returns `true` when the document was written, `false` when its content was
+/// unchanged and the file was skipped.
 async fn import_one(
-    services: &DbServices,
+    services: &Services,
     path: &Path,
     collection: Option<&str>,
     title_override: Option<&str>,
     cfg: &ChunkCfg,
 ) -> Result<bool> {
     let content = std::fs::read_to_string(path)
-        .map_err(|e| ErrorKind::DataParse.msg(format!("cannot read {}: {e}", path.display())))?;
+        .map_err(|e| AppError::message(format!("cannot read {}: {e}", path.display())))?;
     let (front_title, body) = extract_frontmatter(&content);
     let title = title_override
         .map(String::from)
         .or(front_title)
         .unwrap_or_else(|| stem_name(path));
     let source = path.display().to_string();
+    let collection = collection_of(collection.unwrap_or(""));
     let outcome = services
         .knowledge
-        .upsert_document(&source, &title, collection.unwrap_or(""), &body, cfg, false)
+        .upsert_document(&source, &title, &collection, &body, cfg, false)
         .await?;
     if outcome.imported {
         println!("  imported: {title} ({} chunks)", outcome.chunk_count);
@@ -154,17 +159,14 @@ async fn import_one(
     Ok(outcome.imported)
 }
 
-/// 收集待导入文件：文件直接取；目录需 `--recursive`（显式防误导入），
-/// 递归收集目录树下的 .md/.txt。
 fn collect_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = Vec::new();
     for p in paths {
-        let meta = std::fs::metadata(p).map_err(|e| {
-            ErrorKind::BadRequest.msg(format!("cannot access {}: {e}", p.display()))
-        })?;
+        let meta = std::fs::metadata(p)
+            .map_err(|e| AppError::message(format!("cannot access {}: {e}", p.display())))?;
         if meta.is_file() {
             if !is_importable(p) {
-                return Err(ErrorKind::BadRequest.msg(format!(
+                bail!(AppError::message(format!(
                     "'{}' is not an importable file (.md/.txt)",
                     p.display()
                 )));
@@ -172,7 +174,7 @@ fn collect_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
             files.push(p.clone());
         } else if meta.is_dir() {
             if !recursive {
-                return Err(ErrorKind::BadRequest.msg(format!(
+                bail!(AppError::message(format!(
                     "'{}' is a directory; use --recursive to import recursively",
                     p.display()
                 )));
@@ -180,16 +182,15 @@ fn collect_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
             walk_dir(p, &mut files)?;
         }
     }
-    // 按路径排序，导入顺序稳定
     files.sort();
     Ok(files)
 }
 
 fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)
-        .map_err(|e| ErrorKind::BadRequest.msg(format!("cannot read dir {}: {e}", dir.display())))?
+        .map_err(|e| AppError::message(format!("cannot read dir {}: {e}", dir.display())))?
     {
-        let entry = entry.map_err(|e| ErrorKind::BadRequest.msg(e.to_string()))?;
+        let entry = entry.map_err(|e| AppError::message(e.to_string()))?;
         let path = entry.path();
         if path.is_dir() {
             walk_dir(&path, out)?;
@@ -213,11 +214,8 @@ fn stem_name(path: &Path) -> String {
         .to_string()
 }
 
-/// 提取 Markdown frontmatter 的 title（零依赖手写解析）；
-/// 返回 (title, 剥离 frontmatter 后的正文)。无 frontmatter → (None, 原文)。
-///
-/// 要求 head 内存在 `key: value` 结构才视为 frontmatter（文件顶部的 `---`
-/// 也可能是水平线分隔，避免误剥离正文）。
+/// Returns the frontmatter title with the body stripped of the block, or the
+/// input unchanged when there is no frontmatter.
 fn extract_frontmatter(content: &str) -> (Option<String>, String) {
     let Some(rest) = content.strip_prefix("---") else {
         return (None, content.to_string());
@@ -237,25 +235,22 @@ fn extract_frontmatter(content: &str) -> (Option<String>, String) {
             None
         }
     });
-    // `\n---` 为 4 字节；end 指向 `\n` 的下标
     let body_start = end + 4;
     let body = rest.get(body_start..).unwrap_or("");
     (title, body.trim_start_matches('\n').to_string())
 }
 
-// ── list / search ───────────────────────────────────────────────────────────
-
-async fn list(services: &DbServices, collection: Option<&str>) -> Result<()> {
-    let docs = services.knowledge.list(collection).await?;
+async fn list(services: &Services, collection: Option<&str>) -> Result<()> {
+    let collection = collection.map(collection_of);
+    let docs = services.knowledge.list(collection.as_ref()).await?;
     if docs.is_empty() {
         println!("(empty)");
         return Ok(());
     }
     for doc in docs {
-        let col = if doc.collection.is_empty() {
-            "-"
-        } else {
-            &doc.collection
+        let col = match &doc.collection {
+            Collection::Uncategorised => "-",
+            named => named.as_str(),
         };
         println!("{:<38}  {:<24}  {}", doc.id, col, doc.title);
     }
@@ -263,12 +258,14 @@ async fn list(services: &DbServices, collection: Option<&str>) -> Result<()> {
 }
 
 async fn search(
-    services: &DbServices,
+    services: &Services,
     query: &str,
     collection: Option<&str>,
     limit: i64,
 ) -> Result<()> {
-    let collections: Vec<String> = collection.map(|c| vec![c.to_string()]).unwrap_or_default();
+    let collections: Vec<Collection> = collection
+        .map(|c| vec![collection_of(c)])
+        .unwrap_or_default();
     let hits = services
         .knowledge
         .search(query, limit, &collections)
@@ -278,15 +275,19 @@ async fn search(
         return Ok(());
     }
     for hit in hits {
-        let col = if hit.collection.is_empty() {
-            "-"
-        } else {
-            &hit.collection
+        let col = match &hit.collection {
+            Collection::Uncategorised => "-",
+            named => named.as_str(),
         };
         let snippet: String = hit.content.chars().take(120).collect();
+        let score = match (hit.score, hit.distance) {
+            (Some(score), _) => format!("p={score:.4}"),
+            (None, Some(distance)) => format!("d={distance:.4}"),
+            (None, None) => "-".to_owned(),
+        };
         println!(
-            "[{col}] {} (id={}, d={:.4})\n    {}",
-            hit.document_title, hit.document_id.0, hit.distance, snippet
+            "[{col}] {} (id={}, {score})\n    {}",
+            hit.document_title, hit.document_id.0, snippet
         );
     }
     Ok(())

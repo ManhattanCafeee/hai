@@ -2,127 +2,90 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use genai::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
-use struct_patch::Patch;
-use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
+use strum::{EnumString, IntoStaticStr};
 
 use crate::{
-    agentcore::ProviderKind,
-    config::{Paths, meta::AGENT_NAME},
-    error::{AppResultExt, ErrorKind, Result},
+    agentcore::{Language, ModelKind, ProviderKind},
+    config::{
+        ConfigIssue, Paths,
+        meta::{AGENT_NAME, PROJECT_NAME},
+    },
+    error::{AppError, Result},
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Patchable Config Structs
-//   有 `#[derive(Patch)]`，支持热加载时的字段级增量更新。
-//   规则：嵌套在另一 Patch struct 下的子 struct，也应加 Patch。
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// ── Agent ──
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct PersonalityConfig {
     pub name: String,
-    /// 人格自述（一体式自由文本：人设底色 + 行为礼仪 + 情感分寸，风格层）。
-    pub description: String,
 }
 
 impl Default for PersonalityConfig {
     fn default() -> Self {
         Self {
             name: AGENT_NAME.into(),
-            description: "你很聪明，也懂得察言观色——能读懂话里的情绪和潜台词。\
-            你有自己的主见，观点清晰，说得清理由，也听得进反对。\
-            你说话像朋友，自然随和；不啰嗦，不解释对方显然已经知道的东西。\
-            你熟悉网络梗和二次元，偶尔也会玩梗。\
-            你待人真实，不客套。\
-            你知道什么时候接话，什么时候看看就好。"
-                .into(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch, Default)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AgentConfig {
-    pub provider: String,
-    pub model: String,
-    pub max_tokens: Option<u32>,
-    pub reasoning: bool,
-    pub reasoning_effort: String,
-    pub temperature: f32,
+    /// Default for chats that never set their own (`docs/topics/prompting.md`).
+    pub language: Language,
 
     pub context: ContextConfig,
     pub personality: PersonalityConfig,
     pub attention: AttentionConfig,
+    pub multimodal: MultimodalConfig,
+    pub retrieval: RetrievalConfig,
 }
 
-impl AgentConfig {
-    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        let r = ReasoningEffort::from_keyword(&self.reasoning_effort);
-        if r.is_none() {
-            tracing::warn!("Invalid reasoning_effort '{}'", self.reasoning_effort);
-        }
-        r
-    }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PromptConfig {
+    pub soul: Option<String>,
+    pub agents: Option<String>,
+    pub group: Option<String>,
+    pub private: Option<String>,
+    pub wrap_up: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ContextConfig {
-    pub system_prompt: String,
-    pub group_prompt: String,
-    pub private_prompt: String,
-    /// 首轮种子由未读 + 历史凑成。
+    /// First-round seed: unread messages, topped up with history to reach this count.
     pub context_seed_cap: i64,
-    pub related_memory_limit: i64,
-    pub related_topic_limit: i64,
-    /// 闲置超过此时长的话题标记为 need-close。
+    /// Cap on pinned, still-valid Memory entries in the chapter-opening injection block.
+    pub pinned_memory_limit: i64,
+    /// Idle hours after which a Topic renders the need-close hint.
     pub topic_idle_hours: i64,
+    /// Seconds without a run after which the chapter closes.
     pub session_idle_timeout_secs: u64,
     pub steering: bool,
-    /// 触发重开的 context_tokens 阈值（= 最近一次 turn 的 prompt_tokens）；0 = 禁用。
+    /// Context tokens (the last Turn's prompt tokens) at which the chapter wraps up; 0 disables.
     pub compact_token_threshold: u32,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            system_prompt: String::new(),
-            group_prompt: "这是群聊。不要每句话都接，大部分时候你只需要看着。\n\
-                别人聊的话题你插不上嘴就别硬接，跟你没关系的事保持安静就好。\n\
-                消息是有发送对象的，看清楚是发给谁的。没点你名就别自作多情。\n\
-                除非对方明确问到你、或者你真的有别人不太可能想到的话要说，否则没什么好说的就别说。\n\
-                不要替别人回答问题，别人问的不是你，除非对方回答有严重错误必须补充纠正防止话题导向错误结论。\n\
-                别人换话题了你也别追着旧话题跑，过去了就过去了。"
-                .into(),
-            private_prompt: String::new(),
             context_seed_cap: 10,
-            related_memory_limit: 5,
-            related_topic_limit: 3,
-            topic_idle_hours: 3,
-            session_idle_timeout_secs: 300,
+            pinned_memory_limit: 20,
+            topic_idle_hours: 2,
+            session_idle_timeout_secs: 600,
             steering: true,
             compact_token_threshold: 150_000,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AttentionConfig {
-    /// 基础注意力（0-1）。agent idle 时随机关注 chat 的概率。
+    /// Baseline attention (0-1): the chance an idle agent attends to a Chat unprompted.
     pub base_attention: f64,
-    /// 注意力窗口（秒）。被 @ 或回复后保持高响应的时间。
+    /// How long the agent keeps attending after being addressed or after speaking itself; with the
+    /// attention window open, everything pending dispatches.
     pub window_secs: f64,
 }
 
@@ -135,38 +98,39 @@ impl Default for AttentionConfig {
     }
 }
 
-// ── Auxiliary ──
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch, Default)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
-pub struct AuxiliaryConfig {
-    pub embedding: Option<EmbeddingConfig>,
-    /// video 复用此角色（无独立块）
-    pub vision: Option<VisionConfig>,
-    pub audio: Option<AudioConfig>,
-    pub tts: Option<TtsConfig>,
-    pub image_gen: Option<ImageGenConfig>,
+/// How HAI reads attached media: the switches and the analysis templates, kept apart from which
+/// model does the reading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct MultimodalConfig {
+    pub vision: VisionAnalysisConfig,
+    pub transcription: TranscriptionAnalysisConfig,
+    /// What one request may carry inline; `0` leaves it unbounded. A file over it is refused before
+    /// it is read, since the provider's media shapes carry their data in the request.
+    pub inline_max_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
-pub struct VisionConfig {
-    pub provider: Option<String>,
-    pub model: Option<String>,
+impl Default for MultimodalConfig {
+    fn default() -> Self {
+        Self {
+            vision: VisionAnalysisConfig::default(),
+            transcription: TranscriptionAnalysisConfig::default(),
+            inline_max_bytes: 20 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct VisionAnalysisConfig {
     pub enabled: bool,
     pub image_prompt: Option<String>,
     pub video_prompt: Option<String>,
 }
 
-impl Default for VisionConfig {
+impl Default for VisionAnalysisConfig {
     fn default() -> Self {
         Self {
-            provider: None,
-            model: None,
             enabled: true,
             image_prompt: None,
             video_prompt: None,
@@ -174,99 +138,296 @@ impl Default for VisionConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
-pub struct AudioConfig {
-    pub provider: Option<String>,
-    pub model: Option<String>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TranscriptionAnalysisConfig {
     pub enabled: bool,
     pub prompt: Option<String>,
 }
 
-impl Default for AudioConfig {
+impl Default for TranscriptionAnalysisConfig {
     fn default() -> Self {
         Self {
-            provider: None,
-            model: None,
             enabled: true,
             prompt: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
-pub struct TtsConfig {
+/// Retrieval scoring: the candidate pool one rerank request carries, and how long it may take.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RetrievalConfig {
+    pub candidates: usize,
+    pub candidate_chars: usize,
+    pub timeout_secs: u64,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            candidates: 30,
+            candidate_chars: 768,
+            timeout_secs: 10,
+        }
+    }
+}
+
+/// Model selection per ModelRole: the `default` chat role plus one block per role. A block declares
+/// the model and how to call it; how HAI behaves around it lives under `[agent]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ModelRolesConfig {
+    pub default: ChatConfig,
+    pub embedding: EmbeddingConfig,
+    /// Analyzing video reuses this block; there is no separate one.
+    pub vision: Option<VisionConfig>,
+    pub transcription: Option<TranscriptionConfig>,
+    pub speech: Option<SpeechConfig>,
+    pub image: Option<ImageConfig>,
+    pub rerank: Option<RerankConfig>,
+}
+
+/// The `default` ModelRole: the chat model both `AgentRole`s run on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ChatConfig {
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: Option<u32>,
+    pub reasoning: bool,
+    pub reasoning_effort: String,
+    pub temperature: f32,
+    /// The endpoint to reach this model at, when it is not the provider's own.
+    pub base_url: Option<String>,
+}
+
+impl ChatConfig {
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        let r = ReasoningEffort::from_keyword(&self.reasoning_effort);
+        if r.is_none() {
+            tracing::warn!("Invalid reasoning_effort '{}'", self.reasoning_effort);
+        }
+        r
+    }
+}
+
+/// The `rerank` ModelRole: the cross-encoder that scores retrieval candidates. The provider answers
+/// that kind unless the block states its own `base-url`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RerankConfig {
+    /// Which provider serves the rerank kind; an empty name is the `default` block's provider.
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+}
+
+/// Ceiling on the characters one rerank request carries. A cross-encoder answers within its own
+/// context window and a CJK document spends about a token per character, so the pool stays under
+/// this with room for the query.
+pub const RERANK_REQUEST_CHARS: usize = 24_000;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct VisionConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TranscriptionConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SpeechConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub voice: String,
-    /// 语速，0.25 ~ 4.0
+    /// Speech rate; the API client clamps it to 0.25..4.0.
     pub speed: f32,
+    pub base_url: Option<String>,
 }
 
-impl Default for TtsConfig {
+impl Default for SpeechConfig {
     fn default() -> Self {
         Self {
             provider: None,
             model: None,
-            voice: "alloy".into(),
+            voice: String::new(),
             speed: 1.0,
+            base_url: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
+/// The `embedding` ModelRole. `dimension` is the model's output width, and the pgvector columns are
+/// created with it; the block has to state it, since HAI does not know a model's width.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct EmbeddingConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub dimension: Option<i32>,
+    pub base_url: Option<String>,
 }
 
-impl EmbeddingConfig {
-    pub fn dimension(&self) -> i32 {
-        self.dimension.unwrap_or(1024)
-    }
+/// The width the embedding vectors are stored at. The block states it: a guess would size every
+/// vector column wrongly.
+pub fn resolve_embedding_dimension(block: &EmbeddingConfig) -> Result<i32> {
+    block.dimension.ok_or_else(|| {
+        ConfigIssue::model_role(
+            ModelKind::Embedding,
+            "dimension is required (the pgvector columns are created with it)",
+        )
+        .into()
+    })
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
-pub struct ImageGenConfig {
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ImageConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub base_url: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
-pub struct McpConfig {
-    pub r#type: McpTransport,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Option<HashMap<String, String>>,
+/// Networking: the body-extraction chain behind `read` and the retrieval chain behind `web_search`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WebConfig {
+    pub fetch: WebFetchConfig,
+    pub search: WebSearchConfig,
+    /// Provider credentials, shared by the search and fetch chains.
+    pub providers: WebProvidersConfig,
 }
 
-impl Default for McpConfig {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WebFetchConfig {
+    pub chain: Vec<FetchEngine>,
+    pub timeout_secs: u64,
+    pub max_bytes: usize,
+    pub user_agent: String,
+}
+
+impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
-            r#type: McpTransport::Stdio,
-            command: String::new(),
-            args: Vec::new(),
-            env: None,
+            chain: vec![
+                FetchEngine::Local,
+                FetchEngine::Provider(WebProvider::Parallel),
+            ],
+            timeout_secs: 20,
+            max_bytes: 2 * 1024 * 1024,
+            user_agent: format!("{}/{}", PROJECT_NAME, env!("CARGO_PKG_VERSION")),
         }
     }
 }
 
-/// MCP 传输协议（stdio 已实现；streamable-http 未实现）
+/// Body-extraction engine. `local` extracts in-process with no endpoint or credential; every
+/// other value names a [`WebProvider`] and is usable only if its declared capability includes
+/// `fetch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum FetchEngine {
+    Local,
+    Provider(WebProvider),
+}
+
+impl FetchEngine {
+    /// The one spelling of the local engine: [`FetchEngine::as_str`], the parser and the error text
+    /// all read it.
+    const LOCAL: &'static str = "local";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FetchEngine::Local => Self::LOCAL,
+            FetchEngine::Provider(provider) => provider.into(),
+        }
+    }
+}
+
+impl TryFrom<String> for FetchEngine {
+    type Error = AppError;
+
+    fn try_from(raw: String) -> std::result::Result<Self, Self::Error> {
+        raw.parse().map_err(|_| {
+            let providers: Vec<&str> = WebProvider::BUILTIN_ORDER
+                .iter()
+                .map(|id| (*id).into())
+                .collect();
+            AppError::message(format!(
+                "unknown fetch engine {raw:?}, expected {:?} or one of {}",
+                FetchEngine::LOCAL,
+                providers.join(", ")
+            ))
+        })
+    }
+}
+
+impl From<FetchEngine> for String {
+    fn from(engine: FetchEngine) -> Self {
+        engine.as_str().to_owned()
+    }
+}
+
+impl std::fmt::Display for FetchEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FetchEngine {
+    type Err = strum::ParseError;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw {
+            Self::LOCAL => Ok(FetchEngine::Local),
+            other => other.parse().map(FetchEngine::Provider),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WebSearchConfig {
+    /// Empty falls back to the built-in order.
+    pub chain: Vec<WebProvider>,
+    pub timeout_secs: u64,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            chain: Vec::new(),
+            timeout_secs: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WebProvidersConfig {
+    pub parallel: ApiKeyConfig,
+    pub exa: ApiKeyConfig,
+    pub tavily: ApiKeyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ApiKeyConfig {
+    pub api_key: Option<String>,
+}
+
+/// Web provider identity, shared by the search and fetch chains; the capability table lives in
+/// `agent/web/provider/table.rs`.
 #[derive(
     Debug,
     Clone,
@@ -282,18 +443,36 @@ impl Default for McpConfig {
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
-pub enum McpTransport {
+pub enum WebProvider {
     #[default]
-    Stdio,
-    StreamableHttp,
+    Parallel,
+    Exa,
+    Tavily,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
+impl WebProvider {
+    pub const BUILTIN_ORDER: [WebProvider; 3] =
+        [WebProvider::Parallel, WebProvider::Exa, WebProvider::Tavily];
+}
+
+impl WebProvidersConfig {
+    /// This provider's `api-key`; blank counts as unconfigured.
+    pub fn api_key(&self, provider: WebProvider) -> Option<&str> {
+        let slot = match provider {
+            WebProvider::Parallel => &self.parallel,
+            WebProvider::Exa => &self.exa,
+            WebProvider::Tavily => &self.tavily,
+        };
+        slot.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct DatabaseConfig {
-    /// PostgreSQL 连接字符串，例如：postgres://user:password@localhost/dbname
     pub url: String,
     pub max_connections: u32,
 }
@@ -307,43 +486,23 @@ impl Default for DatabaseConfig {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Non-Patchable Config Structs
-//   无 `Patch`，热加载时只能整体替换。
-//   理由：整体替换即可满足需求，或属于启动时一次性配置。
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Bot 平台原始配置（反序列化用，需后续解析为 BotConfig）
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct BotConfigRaw {
-    #[serde(rename = "type")]
-    pub bot_type: Option<String>,
-    pub bot_token: Option<String>,
-    pub allowed_chat_ids: Option<Vec<i64>>,
-    pub rich_message: bool,
-}
-
 impl ProviderConfig {
-    /// 解析 provider 类型。如果配置了 `type` 则用它，否则从名称推断。
-    pub fn infer_kind(&self, name: &str) -> Result<ProviderKind> {
-        match self.r#type {
-            Some(v) => Ok(v),
-            None => ProviderKind::from_str(name)
-                .err_kind_msg(ErrorKind::Config, format!("Invalid provider type '{name}'")),
-        }
+    /// The chat transport this entry names: the explicit `type`, else the name when it is one.
+    /// A provider that serves only a non-chat kind (a self-hosted reranker) names neither.
+    pub fn kind(&self, name: &str) -> Option<ProviderKind> {
+        self.r#type.or_else(|| ProviderKind::from_str(name).ok())
     }
 }
 
-/// 单个 provider 的配置
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ProviderConfig {
-    /// provider 类型，如 openai, anthropic, requesty 等
     pub r#type: Option<ProviderKind>,
-    /// API key（Ollama 等本地服务可省略）
+    /// API key; omittable for local services such as Ollama.
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// Extra request headers for this provider (gateways and resellers).
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(
@@ -385,77 +544,40 @@ impl Default for ContainerRuntime {
     }
 }
 
-/// 被动注入配置（RAG 自动检索注入 `<knowledge>` 节）。
-/// 聚合到 `[knowledge.inject]`：开关 + 条数 + 白名单，与分块参数（数据面）职责分离。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
-pub struct KnowledgeInjectConfig {
-    /// 被动注入开关：true = 每 turn 首轮自动检索注入 `<knowledge>` 节；
-    /// false = 不注入（`search_knowledge_base` 主动工具不受影响）。
-    pub enable: bool,
-    pub limit: i64,
-    /// collection 白名单；空 = 全部库
-    pub collections: Vec<String>,
-}
-
-impl Default for KnowledgeInjectConfig {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            limit: 5,
-            collections: Vec::new(),
-        }
-    }
-}
-
-/// KnowledgeBase 配置：分块参数与 RAG 检索注入。
-/// ```toml
-/// [knowledge]
-/// chunk-size = 512
-/// chunk-overlap = 51
-/// chunk-max = 1536
-///
-/// [knowledge.inject]
-/// enable = false      # 被动注入开关；主动工具 search_knowledge_base 不受影响
-/// limit = 5           # 注入块数上限
-/// collections = []    # collection 白名单；空 = 全部
-/// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct KnowledgeConfig {
-    /// 目标块长（Unicode 字符）
+    /// When false, `search_knowledge_base` is not mounted.
+    pub enabled: bool,
+    /// Target chunk length, in Unicode chars.
     pub chunk_size: usize,
-    /// 相邻块重叠（字符）
+    /// Overlap between adjacent chunks, in Unicode chars.
     pub chunk_overlap: usize,
-    /// 单块硬上限（字符）
+    /// Split trigger and sub-split budget for one unit, in Unicode chars; a unit that cannot be
+    /// split below it stays oversized.
     pub chunk_max: usize,
-    pub inject: KnowledgeInjectConfig,
 }
 
 impl Default for KnowledgeConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             chunk_size: 512,
             chunk_overlap: 51,
             chunk_max: 1536,
-            inject: KnowledgeInjectConfig::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Patch)]
-#[patch(attribute(derive(Debug, Default, Clone, Serialize, Deserialize)))]
-#[patch(attribute(skip_serializing_none))]
-#[serde(default, rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct SandboxConfig {
     pub enabled: bool,
     pub runtime: ContainerRuntime,
     pub image: String,
     pub timeout_secs: u64,
+    /// Extra directories bound read-only into the container at their own paths.
+    pub mounts: Vec<PathBuf>,
 }
 
 impl Default for SandboxConfig {
@@ -465,24 +587,16 @@ impl Default for SandboxConfig {
             runtime: ContainerRuntime::default(),
             image: "ubuntu:latest".into(),
             timeout_secs: 30,
+            mounts: Vec::new(),
         }
     }
 }
 
-/// Skills 配置
-///
-/// 指定扫描 SKILL.md 的目录列表，支持全局目录和项目本地目录。
-/// 示例 hai.toml：
-/// ```toml
-/// [skills]
-/// dirs = ["~/.config/hai/skills", ".hai/skills"]
-/// disabled = ["skill-name"]
-/// ```
+/// Directories scanned for `SKILL.md`, both global and project-local.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct SkillsConfig {
     pub dirs: Vec<PathBuf>,
-    /// 禁用的 skill 名称列表，不在 discovery 和工具中展示
     #[serde(default)]
     pub disabled: Vec<String>,
 }
@@ -496,8 +610,15 @@ impl Default for SkillsConfig {
     }
 }
 
+/// Disabled tool names; an MCP tool is named by its registration name `mcp__<server>_<tool>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ToolsConfig {
+    pub disabled: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct LoggingConfig {
     pub level: String,
 }
@@ -512,60 +633,141 @@ impl Default for LoggingConfig {
 
 impl LoggingConfig {
     pub fn level(&self) -> Result<tracing::Level> {
-        tracing::Level::from_str(&self.level).err_kind_msg(
-            ErrorKind::Config,
-            format!("Invalid logging level '{}'", self.level),
+        tracing::Level::from_str(&self.level)
+            .map_err(|e| AppError::message(format!("Invalid logging level '{}': {e}", self.level)))
+    }
+}
+
+/// One `[channel.<name>]` section: the platform it names and the keys only that platform understands.
+/// The shared layer passes the section on untouched; the platform that claims it parses and
+/// validates its own keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ChannelSection {
+    /// The platform this section names; absent means the section's own name is the platform.
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    /// The section's own keys, as written.
+    #[serde(flatten)]
+    pub settings: HashMap<String, serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use strum::IntoEnumIterator;
+
+    use super::*;
+    use crate::test_support::assert_names_agree;
+
+    /// `[channel.<name>]` is neutral: the shared layer keeps the platform's own keys untouched, so a
+    /// second platform's keys need no change here.
+    #[test]
+    fn a_channel_section_keeps_its_platforms_keys() {
+        use serde_json::json;
+
+        use crate::config::AppConfig;
+
+        let cfg: AppConfig = toml::from_str(
+            "[channel.telegram]\n\
+             bot-token = \"a-token\"\n\
+             allowed-chat-ids = [1]\n\
+             rich-message = true\n\
+             \n\
+             [channel.main]\n\
+             type = \"telegram\"\n",
         )
-    }
-}
+        .expect("a readable config");
 
-/// 解析后的 bot 配置
-#[derive(Debug, Clone)]
-pub struct BotConfig {
-    pub key: String,
-    pub platform: BotPlatform,
-    pub bot_token: String,
-    pub allowed_chat_ids: Vec<i64>,
-    pub rich_message: bool,
-}
+        let named = &cfg.channel["telegram"];
+        assert_eq!(named.kind, None, "no type means the name is the platform");
+        assert_eq!(named.settings["bot-token"], json!("a-token"));
+        assert_eq!(named.settings["allowed-chat-ids"], json!([1]));
+        assert_eq!(cfg.channel["main"].kind.as_deref(), Some("telegram"));
 
-#[derive(Debug, Clone, Copy, PartialEq, EnumIter, EnumString, IntoStaticStr)]
-#[strum(serialize_all = "lowercase")]
-pub enum BotPlatform {
-    Telegram,
-}
-
-impl BotPlatform {
-    pub fn supported_types() -> Vec<&'static str> {
-        Self::iter().map(Into::into).collect()
+        // `hai config --format toml` prints the section as written.
+        let printed = toml::to_string_pretty(&cfg).expect("a printable config");
+        assert!(printed.contains("bot-token"), "{printed}");
+        assert!(printed.contains("rich-message"), "{printed}");
     }
 
-    pub fn label(&self) -> &'static str {
-        self.into()
+    #[test]
+    fn config_enum_names_agree_between_serde_and_strum() {
+        assert_names_agree(
+            [WebProvider::Parallel, WebProvider::Exa, WebProvider::Tavily],
+            |provider| provider.into(),
+        );
+        assert_names_agree(
+            [
+                crate::agentcore::mcp::McpTransport::Stdio,
+                crate::agentcore::mcp::McpTransport::StreamableHttp,
+            ],
+            |transport| transport.into(),
+        );
+        assert_names_agree(
+            [ContainerRuntime::Docker, ContainerRuntime::Podman],
+            |runtime| runtime.as_str(),
+        );
+        assert_names_agree(ProviderKind::iter(), |kind| kind.into());
     }
-}
 
-impl BotConfig {
-    /// 从 key + raw 解析出配置，未指定 type 时根据 key 名推断
-    pub fn resolve(key: &str, raw: &BotConfigRaw) -> Result<Self> {
-        let platform = Self::resolve_platform(key, raw)?;
-        Ok(Self {
-            key: key.to_string(),
-            platform,
-            bot_token: raw.bot_token.clone().unwrap_or_default(),
-            allowed_chat_ids: raw.allowed_chat_ids.clone().unwrap_or_default(),
-            rich_message: raw.rich_message,
-        })
+    /// The two bounds on a rerank request have to hold together for the default to be usable.
+    #[test]
+    fn the_rerank_defaults_fit_a_chunk_and_a_request() {
+        let retrieval = AgentConfig::default().retrieval;
+        let knowledge = KnowledgeConfig::default();
+
+        assert!(
+            retrieval.candidate_chars >= knowledge.chunk_size,
+            "a candidate narrower than a chunk would rerank a truncated passage"
+        );
+        assert!(
+            retrieval.candidates * retrieval.candidate_chars <= RERANK_REQUEST_CHARS,
+            "the candidate pool would not fit one rerank request"
+        );
     }
 
-    fn resolve_platform(key: &str, raw: &BotConfigRaw) -> Result<BotPlatform> {
-        let typ = raw.bot_type.as_deref().unwrap_or(key);
-        BotPlatform::from_str(typ).err_kind_msg(
-            ErrorKind::Config,
-            format!(
-                "Unknown bot type '{typ}, supported: {}",
-                BotPlatform::supported_types().join(", ")
-            ),
-        )
+    #[test]
+    fn fetch_engine_round_trips_as_flat_strings() {
+        let parsed: Vec<FetchEngine> =
+            serde_json::from_str(r#"["local","parallel","exa"]"#).expect("config vocabulary");
+        assert_eq!(
+            parsed,
+            vec![
+                FetchEngine::Local,
+                FetchEngine::Provider(WebProvider::Parallel),
+                FetchEngine::Provider(WebProvider::Exa)
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("serialize"),
+            r#"["local","parallel","exa"]"#
+        );
+    }
+
+    #[test]
+    fn api_key_reads_the_provider_slot_and_ignores_blanks() {
+        let mut cfg = WebProvidersConfig::default();
+        assert!(cfg.api_key(WebProvider::Tavily).is_none());
+
+        cfg.tavily.api_key = Some("  ".to_owned());
+        assert!(cfg.api_key(WebProvider::Tavily).is_none());
+
+        cfg.tavily.api_key = Some(" k ".to_owned());
+        assert_eq!(cfg.api_key(WebProvider::Tavily), Some("k"));
+
+        cfg.exa.api_key = Some("e".to_owned());
+        assert_eq!(cfg.api_key(WebProvider::Exa), Some("e"));
+        assert!(cfg.api_key(WebProvider::Parallel).is_none());
+    }
+
+    #[test]
+    fn fetch_engine_rejects_unknown_vocabulary() {
+        assert!(serde_json::from_str::<FetchEngine>(r#""brave""#).is_err());
+        assert!(serde_json::from_str::<FetchEngine>(r#"{"provider":"exa"}"#).is_err());
+    }
+
+    #[test]
+    fn a_missing_embedding_dimension_is_an_error() {
+        assert!(resolve_embedding_dimension(&EmbeddingConfig::default()).is_err());
     }
 }

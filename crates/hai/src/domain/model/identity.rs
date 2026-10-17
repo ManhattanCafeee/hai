@@ -2,7 +2,7 @@ use crate::domain::vo::IdentityId;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Identity {
-    pub id: uuid::Uuid,
+    pub id: IdentityId,
 
     pub name: Option<String>,
     pub meta: Option<serde_json::Value>,
@@ -10,10 +10,4 @@ pub struct Identity {
     pub created_at: jiff::Timestamp,
     #[sqlx(try_from = "jiff_sqlx::Timestamp")]
     pub updated_at: jiff::Timestamp,
-}
-
-impl Identity {
-    pub fn id_(&self) -> IdentityId {
-        IdentityId(self.id)
-    }
 }

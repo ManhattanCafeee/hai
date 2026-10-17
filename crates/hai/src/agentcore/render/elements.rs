@@ -3,14 +3,10 @@ use std::fmt::{Display, Formatter};
 use indexmap::IndexMap;
 use serde::Serialize;
 
-// ─── AttrValue ─────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub enum AttrValue {
-    Null,
     String(String),
     Int(i64),
-    Float(f64),
     Bool(bool),
 }
 
@@ -20,10 +16,8 @@ impl Serialize for AttrValue {
         S: serde::Serializer,
     {
         match self {
-            AttrValue::Null => serializer.serialize_unit(),
             AttrValue::String(s) => serializer.serialize_str(s),
             AttrValue::Int(i) => serializer.serialize_i64(*i),
-            AttrValue::Float(f) => serializer.serialize_f64(*f),
             AttrValue::Bool(b) => serializer.serialize_bool(*b),
         }
     }
@@ -32,10 +26,8 @@ impl Serialize for AttrValue {
 impl Display for AttrValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            AttrValue::Null => write!(f, "null"),
             AttrValue::String(s) => write!(f, "{}", s),
             AttrValue::Int(i) => write!(f, "{}", i),
-            AttrValue::Float(fl) => write!(f, "{}", fl),
             AttrValue::Bool(b) => write!(f, "{}", b),
         }
     }
@@ -71,12 +63,6 @@ impl From<i32> for AttrValue {
     }
 }
 
-impl From<f64> for AttrValue {
-    fn from(f: f64) -> Self {
-        AttrValue::Float(f)
-    }
-}
-
 impl From<bool> for AttrValue {
     fn from(b: bool) -> Self {
         AttrValue::Bool(b)
@@ -94,18 +80,6 @@ impl From<jiff::Timestamp> for AttrValue {
         AttrValue::String(t.to_string())
     }
 }
-
-// ─── Format ────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum Format {
-    #[default]
-    Xml,
-    Json,
-    Md,
-}
-
-// ─── Node ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum Node {
@@ -165,34 +139,15 @@ impl Node {
         }
     }
 
-    pub fn push_child(&mut self, child: impl Into<Node>) {
-        if let Node::Elem { children, .. } = self {
-            children.push(child.into());
-        }
-    }
-
-    pub fn children_mut(&mut self) -> Option<&mut Vec<Node>> {
-        match self {
-            Node::Elem { children, .. } => Some(children),
-            Node::Text(_) => None,
-        }
-    }
-
+    /// Empty means no children and no attributes: an attribute-only element such as `<chat …/>`
+    /// still carries content and must not be dropped.
     pub fn is_empty(&self) -> bool {
         match self {
-            Node::Elem { children, .. } => children.is_empty(),
+            Node::Elem {
+                attrs, children, ..
+            } => children.is_empty() && attrs.is_empty(),
             Node::Text(_) => false,
         }
-    }
-
-    pub fn with_text(mut self, text: impl Into<String>) -> Self {
-        if let Node::Elem {
-            ref mut children, ..
-        } = self
-        {
-            children.push(Node::Text(text.into()));
-        }
-        self
     }
 }
 
@@ -208,33 +163,15 @@ impl From<&str> for Node {
     }
 }
 
-// ─── Node → serde_json::Value ─────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Node {
-    /// 转换为 serde_json::Value（Item 风格的表示：`_tag` + attrs + children）
-    pub fn to_json_value(&self) -> serde_json::Value {
-        match self {
-            Node::Text(t) => serde_json::Value::String(t.clone()),
-            Node::Elem {
-                tag,
-                attrs,
-                children,
-            } => {
-                let mut map = serde_json::Map::new();
-                map.insert("_tag".to_string(), serde_json::Value::String(tag.clone()));
-                for (k, v) in attrs {
-                    map.insert(k.clone(), serde_json::to_value(v).unwrap_or_default());
-                }
-                if !children.is_empty() {
-                    map.insert(
-                        "children".to_string(),
-                        serde_json::Value::Array(
-                            children.iter().map(|c| c.to_json_value()).collect(),
-                        ),
-                    );
-                }
-                serde_json::Value::Object(map)
-            }
-        }
+    #[test]
+    fn attribute_only_element_is_not_empty() {
+        assert!(Node::tag("situation").is_empty());
+        assert!(!Node::tag("chat").attr("id", 2).is_empty());
+        assert!(!Node::tag("topic").child(Node::text("summary")).is_empty());
+        assert!(!Node::text("").is_empty());
     }
 }

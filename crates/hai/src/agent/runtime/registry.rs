@@ -1,93 +1,114 @@
-use std::{collections::HashMap, sync::Arc};
+//! One channel's live ChatAgents: spawned on demand, pruned when their task ends, and drained on
+//! shutdown. This is where a chat is bound to the channel it lives on — each agent gets its own
+//! handle, plus the runtime and the cancellation token.
+
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::{
     sync::{RwLock, mpsc},
     task::JoinHandle,
+    time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{
-    AgentEngine,
-    event::Inbox,
-    session::{Conversation, SessionHandle},
+    AgentRuntime,
+    chat::{ChatAgent, ChatAgentRef},
+    event::Doorbell,
 };
-use crate::{agent::link::PlatformHandler, domain::vo::ChatId, error::Result};
+use crate::{
+    agent::channel::{Channel, ChannelHandle},
+    domain::vo::ChatId,
+};
 
 #[derive(Clone)]
-pub struct SessionManager {
-    sessions: Arc<RwLock<HashMap<ChatId, SessionEntry>>>,
-    handler: Arc<dyn PlatformHandler>,
-    engine: AgentEngine,
+pub struct AgentRegistry {
+    agents: Arc<RwLock<HashMap<ChatId, AgentEntry>>>,
+    /// The channel every agent here runs on, unbound: each chat is bound to it as that agent starts.
+    channel: Arc<dyn Channel>,
+    runtime: AgentRuntime,
+    shutdown: CancellationToken,
 }
 
-struct SessionEntry {
-    handle: SessionHandle,
-    task: Arc<JoinHandle<()>>,
+struct AgentEntry {
+    handle: ChatAgentRef,
+    task: JoinHandle<()>,
 }
 
-impl SessionManager {
-    pub fn new(handler: Arc<dyn PlatformHandler>, engine: AgentEngine) -> Self {
+impl AgentRegistry {
+    pub fn new(
+        channel: Arc<dyn Channel>,
+        runtime: AgentRuntime,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            handler,
-            engine,
+            agents: Arc::new(RwLock::new(HashMap::new())),
+            channel,
+            runtime,
+            shutdown,
         }
     }
 
-    /// 按需创建/复用会话执行环境：dead 条目先清理，存活则复用，否则重建
-    /// （恢复 = 重建环境 + 载入对话状态；DB 违约上抛，不吞错）。
-    pub async fn get_or_create(&self, chat_id: ChatId) -> Result<SessionHandle> {
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_, e| !e.task.is_finished());
-        if let Some(entry) = sessions.get(&chat_id) {
-            return Ok(entry.handle.clone());
+    pub async fn get_or_create(&self, chat_id: ChatId) -> ChatAgentRef {
+        if let Some(entry) = self.agents.read().await.get(&chat_id)
+            && !entry.task.is_finished()
+        {
+            return entry.handle.clone();
         }
-        let entry = self.spawn(chat_id).await?;
+        let mut agents = self.agents.write().await;
+        agents.retain(|_, entry| !entry.task.is_finished());
+        if let Some(entry) = agents.get(&chat_id)
+            && !entry.task.is_finished()
+        {
+            return entry.handle.clone();
+        }
+        let entry = self.spawn(chat_id);
         let handle = entry.handle.clone();
-        sessions.insert(chat_id, entry);
-        Ok(handle)
+        agents.insert(chat_id, entry);
+        handle
     }
 
-    async fn spawn(&self, chat_id: ChatId) -> Result<SessionEntry> {
-        let record = self.engine.app.db.srv.conversation.get(chat_id).await?;
-        let conversation = match record {
-            Some(r) => {
-                // updated_at（最后保存 ≈ 最后活动）作为恢复超期判定基准（章节重开）
-                Conversation::from_snapshot(
-                    self.engine.app.db.srv.conversation.restore(&r),
-                    Some(r.updated_at),
-                )
-            }
-            None => Conversation::new(),
-        };
+    /// A live agent for the chat, without spawning one; a finished or absent entry reads as none.
+    pub async fn get(&self, chat_id: ChatId) -> Option<ChatAgentRef> {
+        let agents = self.agents.read().await;
+        let entry = agents.get(&chat_id)?;
+        if entry.task.is_finished() {
+            return None;
+        }
+        Some(entry.handle.clone())
+    }
 
-        let inbox = Inbox::new();
+    fn spawn(&self, chat_id: ChatId) -> AgentEntry {
+        let doorbell = Doorbell::new();
         let (status_tx, status_rx) = mpsc::unbounded_channel();
-
-        let engine = self.engine.clone();
-        let handler = self.handler.clone();
-        let inbox_for_turn = inbox.clone();
-        let sessions_arc = self.sessions.clone();
-
+        let runtime = self.runtime.clone();
+        let chat = ChannelHandle::new(self.channel.clone(), chat_id);
+        let shutdown = self.shutdown.clone();
+        let agents = self.agents.clone();
+        let doorbell_for_turn = doorbell.clone();
         let task = tokio::spawn(async move {
-            let session =
-                super::session::AgentSession::new(engine, chat_id, handler, conversation).await;
-            match session {
-                Ok(mut s) => s.run(inbox_for_turn, status_rx).await,
-                Err(e) => tracing::error!(%chat_id, "Failed to create session: {e}"),
+            match ChatAgent::new(runtime, chat, shutdown).await {
+                Ok(mut agent) => agent.run(doorbell_for_turn, status_rx).await,
+                Err(e) => tracing::error!(%chat_id, "Failed to create agent: {e}"),
             }
-            // 即时清理：环境任务结束即从 registry 移除（对话状态留在 DB，永存）
-            sessions_arc.write().await.remove(&chat_id);
+            agents.write().await.remove(&chat_id);
         });
+        AgentEntry {
+            handle: ChatAgentRef::new(chat_id, doorbell, status_tx),
+            task,
+        }
+    }
 
-        let join = Arc::new(task);
-
-        let handle = SessionHandle {
-            chat_id,
-            inbox,
-            status_tx,
-            join: join.clone(),
+    pub async fn drain(&self, timeout: Duration) {
+        let tasks: Vec<JoinHandle<()>> = {
+            let mut agents = self.agents.write().await;
+            agents.drain().map(|(_, entry)| entry.task).collect()
         };
-
-        Ok(SessionEntry { handle, task: join })
+        let deadline = Instant::now() + timeout;
+        for task in tasks {
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                tracing::warn!("agent drain timed out, remaining agents abandoned");
+            }
+        }
     }
 }

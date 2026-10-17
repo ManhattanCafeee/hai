@@ -1,28 +1,28 @@
-//! 记忆组件 - 构建 XML 节点
-
 use crate::{
-    agent::context::fmt::format_time_dyn, agentcore::render::elements::Node,
-    domain::service::memory::RelatedMemory,
+    agent::context::fmt::format_time_dyn,
+    agentcore::render::elements::Node,
+    domain::{model::Memory, vo::MessageId},
 };
 
-pub(super) fn related_memory_element(mem: &RelatedMemory) -> Node {
-    let source = mem
-        .account_id
-        .map(|id| format!("UserID:{}", id))
-        .unwrap_or_else(|| "System".into());
-
+pub fn memory_element(memory: &Memory) -> Node {
     Node::tag("memory")
-        .attr("id", mem.id.0)
-        .attr("source", source)
-        .attr("relevance", format!("{:.4}", mem.distance))
-        .attr("created_at", format_time_dyn(mem.created_at))
-        .child(Node::text(&mem.content))
+        .attr("id", memory.id.0)
+        .attr("kind", memory.kind.as_str())
+        .attr("pinned", memory.pinned)
+        .attr("at", format_time_dyn(memory.created_at))
+        .child(Node::text(&memory.content))
 }
 
-pub(super) fn related_memories_elements(memories: &[RelatedMemory]) -> Vec<Node> {
-    memories.iter().map(related_memory_element).collect()
+pub fn memory_record(memory: &Memory) -> Node {
+    let mut el = memory_element(memory).attr("status", memory.status.as_str());
+    if !memory.source_message_ids.is_empty() {
+        el = el.attr("messages", source_range(&memory.source_message_ids));
+    }
+    el
 }
 
-pub fn related_memories_section(memories: &[RelatedMemory], tag: &str) -> Node {
-    Node::tag(tag).children(related_memories_elements(memories))
+fn source_range(ids: &[MessageId]) -> String {
+    let first = ids.iter().min().copied().unwrap_or_default();
+    let last = ids.iter().max().copied().unwrap_or_default();
+    format!("{first}-{last}")
 }
