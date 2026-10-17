@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,14 +23,6 @@ impl TryFrom<String> for CollectionName {
         } else {
             Ok(Self(value))
         }
-    }
-}
-
-impl TryFrom<&str> for CollectionName {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::try_from(value.to_owned())
     }
 }
 
@@ -77,10 +69,10 @@ impl TryFrom<String> for Collection {
     }
 }
 
-impl TryFrom<&str> for Collection {
-    type Error = String;
+impl FromStr for Collection {
+    type Err = String;
 
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::try_from(value.to_owned())
     }
 }

@@ -13,7 +13,9 @@ const IMPORT_EXTENSIONS: [&str; 2] = ["md", "txt"];
 
 /// The CLI spells a collection as a plain label; the empty string is the uncategorised bucket.
 fn collection_of(label: &str) -> Collection {
-    Collection::try_from(label).expect("Collection accepts every label")
+    label
+        .parse::<Collection>()
+        .expect("Collection accepts every label")
 }
 
 pub async fn build_services(config: &AppConfig) -> Result<Services> {

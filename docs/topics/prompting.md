@@ -71,7 +71,7 @@ The section is `You are {name}.\n{soul}` under the `# Character` heading, `confi
 
 ### Skills injection
 
-`agentcore/skills/manager.rs:SkillManager::discovery_prompt` emits a `## Skills` section when at least one skill is discoverable: one entry per skill plus the instruction to load a matching one with `read skill://<name>`. `discoverable_skills` excludes skills whose front matter sets `disable-model-invocation`, and `read`'s description mentions `skill://` only while skills exist.
+`agentcore/skills/manager.rs:SkillManager::discovery_prompt` emits a `## Skills` section when at least one skill is discoverable: one entry per skill plus the instruction to load a matching one with `read skill://<name>`. `discoverable_skills` excludes skills whose front matter sets `disable-model-invocation`, and `read`'s description mentions `skill://` only while skills exist. Front matter is strict about top-level keys — `name`, `description`, `license`, `compatibility`, `metadata`, `allowed-tools` — so a SKILL.md carrying an unknown one fails to parse and is skipped with a warning (`agentcore/skills/manager.rs:SkillManager::load_dir`); custom properties belong under `metadata`.
 
 ## Boundaries
 

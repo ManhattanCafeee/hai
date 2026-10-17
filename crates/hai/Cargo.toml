@@ -24,7 +24,6 @@ agent-skills = { workspace = true }
 teloxide = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tracing-serde = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
@@ -37,7 +36,6 @@ roxmltree = { workspace = true }
 derive_more = { workspace = true }
 jiff = { workspace = true }
 jiff-sqlx = { workspace = true }
-anyhow = { workspace = true }
 
 uuid = { workspace = true }
 strum = { workspace = true }
